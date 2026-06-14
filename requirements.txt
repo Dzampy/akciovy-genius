@@ -7,3 +7,4 @@ numpy
 requests
 PyPDF2
 python-dotenv
+kaleido==0.2.1
