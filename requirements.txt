@@ -2,9 +2,9 @@ pandas
 yfinance
 plotly
 groq
-python-telegram-bot
 numpy
 requests
 PyPDF2
 python-dotenv
-kaleido==0.2.1
+python-telegram-bot[job-queue]
+kaleido>=1.0.0
