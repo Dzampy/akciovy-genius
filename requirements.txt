@@ -1,0 +1,8 @@
+pandas
+yfinance
+plotly
+groq
+python-telegram-bot
+numpy
+requests
+PyPDF2
