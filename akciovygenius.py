@@ -73,7 +73,8 @@ SMC_ZONE_MAX_AGE = int(os.getenv("SMC_ZONE_MAX_AGE", "60"))
 # ── Whale Radar konfigurace ───────────────────────────────────────────────────
 # Proaktivní skener celého trhu na velké agresivní opční bloky (lov cizích signálů).
 WHALE_RADAR_INTERVAL = int(os.getenv("WHALE_RADAR_INTERVAL", "180"))   # interval cyklu (s)
-WHALE_MIN_PREMIUM = float(os.getenv("WHALE_MIN_PREMIUM", "1000000"))   # min. prémium bloku ($)
+WHALE_MIN_PREMIUM = float(os.getenv("WHALE_MIN_PREMIUM", "1000000"))         # práh pro velké akcie ($)
+WHALE_MIN_PREMIUM_SMALL = float(os.getenv("WHALE_MIN_PREMIUM_SMALL", "250000"))  # nižší práh pro smallcapy ($)
 WHALE_MIN_AGGR = float(os.getenv("WHALE_MIN_AGGR", "0.6"))             # min. agrese (0=bid, 1=ask)
 WHALE_CHUNK = int(os.getenv("WHALE_CHUNK", "12"))                      # tickerů na jeden cyklus
 WHALE_MAX_ALERTS = int(os.getenv("WHALE_MAX_ALERTS", "5"))             # max alertů na cyklus
@@ -272,13 +273,15 @@ NASDAQ_100 = [
     "TSLA", "TTWO", "TXN", "VRSK", "VRTX", "WMT", "XEL"
 ]
 
-# Smallcap / momentum watchlist (sdílený mezi /whales a Whale Radarem)
+# Smallcap / momentum watchlist (sdílený mezi /whales a Whale Radarem).
+# SPAI a SRFM odebrány – fakticky bez likvidních opcí (objem < 500 / 3 expirace).
 WHALE_SMALLCAPS = [
     "ASTS", "RKLB", "LUNR", "ONDS", "SOUN", "IONQ", "RGTI", "QBTS",
-    "ACHR", "JOBY", "LPTH", "UMAC", "AMPX", "KOPN", "SPAI", "LTRX",
-    "SRFM", "DPRO", "CEG", "NOK", "AAOI", "DDD", "BBAI", "RDW",
+    "ACHR", "JOBY", "LPTH", "UMAC", "AMPX", "KOPN", "LTRX",
+    "DPRO", "CEG", "NOK", "AAOI", "DDD", "BBAI", "RDW",
     "SATL", "HOOD", "OKLO"
 ]
+WHALE_SMALLCAP_SET = set(WHALE_SMALLCAPS)   # rychlá příslušnost → volba prahu
 
 # Univerzum pro proaktivní Whale Radar (NASDAQ-100 + smallcapy, bez duplicit)
 WHALE_UNIVERSE = list(dict.fromkeys(NASDAQ_100 + WHALE_SMALLCAPS))
@@ -1204,9 +1207,11 @@ def scan_ticker_whales(ticker: str) -> list[dict]:
         return []
 
     hits, _ = analyze_options_flow(ticker, spot)
+    # Smallcapy mají menší bloky → nižší práh, ať je radar vůbec zachytí.
+    min_prem = WHALE_MIN_PREMIUM_SMALL if ticker in WHALE_SMALLCAP_SET else WHALE_MIN_PREMIUM
     out = []
     for h in hits:
-        if h["premium"] < WHALE_MIN_PREMIUM:
+        if h["premium"] < min_prem:
             continue
         aggr = aggression_score(h["last"], h["bid"], h["ask"])
         if aggr < WHALE_MIN_AGGR:
@@ -2278,8 +2283,9 @@ async def whaleradar_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"🐋 *WHALE RADAR ZAPNUT*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Skenuji `{len(WHALE_UNIVERSE)}` tickerů na velké agresivní opční bloky "
-            f"(≥ `{fmt_usd(WHALE_MIN_PREMIUM)}` prémium, na/u asku).\n"
+            f"Skenuji `{len(WHALE_UNIVERSE)}` tickerů na velké agresivní opční bloky (na/u asku):\n"
+            f"  • velké akcie ≥ `{fmt_usd(WHALE_MIN_PREMIUM)}`\n"
+            f"  • smallcapy ≥ `{fmt_usd(WHALE_MIN_PREMIUM_SMALL)}`\n"
             f"Pingnu tě, jakmile někdo vsadí velké peníze. 🐳\n"
             f"_Vypnutí:_ `/whaleradar off`",
             parse_mode="Markdown")
