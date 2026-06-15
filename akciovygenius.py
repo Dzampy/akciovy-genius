@@ -18,8 +18,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from plotly.subplots import make_subplots
 import plotly.io as pio
 
-# Vypnutí sandboxu, aby mohl prohlížeč v Dockeru vygenerovat graf
-pio.kaleido.scope.chromium_args += ("--no-sandbox", "--disable-dev-shm-usage")
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from mtf_analysis import analyze_mtf_levels, format_level, format_zone, make_mtf_chart
 from dotenv import load_dotenv

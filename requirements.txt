@@ -7,4 +7,4 @@ requests
 PyPDF2
 python-dotenv
 python-telegram-bot[job-queue]
-kaleido>=1.0.0
+kaleido==0.2.1
