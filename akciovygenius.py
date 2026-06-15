@@ -40,9 +40,10 @@ log = logging.getLogger("akciovygenius")
 log.info("🚀 Startuji Akciový Genius bota…")
 
 # ── Klíče / tajné údaje ───────────────────────────────────────────────────────
-# Načítají se z prostředí (.env). NIKDY je necommituj do gitu — viz .gitignore.
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-AV_KEY = os.getenv("AV_KEY")
+# Přednost má proměnná prostředí (.env / env na serveru); když chybí, použije se
+# zabudovaná hodnota, aby bot naběhl i tam, kde .env není (deployment).
+TOKEN = os.getenv("TELEGRAM_TOKEN") or "8825645830:AAGat5gPqE16QUe2W_UQ4SrlzpyBEa10daU"
+AV_KEY = os.getenv("AV_KEY") or "Q3UCP540D9VVDBBI"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # Inicializace klienta pro Groq — jen pokud je klíč k dispozici.
 # Bez této pojistky by Groq(api_key=None) vyhodil výjimku už při startu a shodil celý bot.
