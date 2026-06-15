@@ -1174,60 +1174,101 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 last_market_text = ""
 
 def get_smc_zones(df):
-    """Vylepšená HFT funkce: Displacement filtr, Proximity filtr a FIRST TOUCH mitigace."""
+    """SMC zóny: Order Blocks (oddělené od FVG) + FVG, s realistickou mitigací.
+
+    OB = poslední opačná svíčka před displacement (impulzní) svíčkou.
+    FVG = 3-svíčkový gap.
+    Mitigace = pozdější svíčka UZAVŘE přes 50 % zóny (ne pouhý dotyk knotem),
+    což odpovídá tomu, jak se zóny reálně „spotřebují". Mitigované zóny se
+    nezahazují — označí se flagem `mitigated`, aby šly vykreslit jako slabší.
+    Vrací 4-tuple dictů s klíči: top, bot, start_idx, mitigated (+ OB má `vol`).
+    """
     bull_fvg, bear_fvg = [], []
     bull_ob, bear_ob = [], []
-    
-    # Průměrné tělo svíčky pro filtr momenta
-    df['body'] = abs(df['Close'] - df['Open'])
-    avg_body = float(df['body'].mean())
-    current_price = float(df['Close'].iloc[-1])
-    
-    for i in range(2, len(df) - 1):
-        p2_h, p2_l = float(df['High'].iloc[i-2]), float(df['Low'].iloc[i-2])
-        c_h, c_l = float(df['High'].iloc[i]), float(df['Low'].iloc[i])
-        
-        # Svíčka musí být o 50% větší než průměr (Displacement)
-        displacement = abs(float(df['Close'].iloc[i-1]) - float(df['Open'].iloc[i-1]))
-        if displacement < avg_body * 1.5: 
-            continue
-            
-        # Bullish FVG & OB
-        if c_l > p2_h:
-            # FIRST TOUCH: Mitigace FVG hned při prvním dotyku knotem shora (c_l)
-            mitigated = any(float(df['Low'].iloc[j]) <= c_l for j in range(i + 1, len(df)))
-            if not mitigated:
-                bull_fvg.append({'top': c_l, 'bot': p2_h, 'start_idx': df.index[i-1]})
-                for k in range(i-2, max(0, i-7), -1):
-                    if float(df['Close'].iloc[k]) < float(df['Open'].iloc[k]): 
-                        ob_t, ob_b = float(df['High'].iloc[k]), float(df['Low'].iloc[k])
-                        # FIRST TOUCH: Mitigace OB dotykem shora (ob_t)
-                        ob_mitig = any(float(df['Low'].iloc[m]) <= ob_t for m in range(k + 1, len(df)))
-                        if not ob_mitig: 
-                            bull_ob.append({'top': ob_t, 'bot': ob_b, 'start_idx': df.index[k]})
+
+    n = len(df)
+    if n < 5:
+        return bull_fvg, bear_fvg, bull_ob, bear_ob
+
+    opens = df['Open'].astype(float).values
+    highs = df['High'].astype(float).values
+    lows = df['Low'].astype(float).values
+    closes = df['Close'].astype(float).values
+    vols = df['Volume'].astype(float).values if 'Volume' in df.columns else np.zeros(n)
+    idx = df.index
+
+    body = np.abs(closes - opens)
+    avg_body = float(body.mean()) if n else 0.0
+    current_price = float(closes[-1])
+
+    def is_mitigated(top, bot, start_pos, direction):
+        """Zóna zasažena, jakmile pozdější svíčka uzavře přes 50 % (mid) zóny."""
+        mid = (top + bot) / 2.0
+        for j in range(start_pos + 1, n):
+            if direction == 'bull' and closes[j] <= mid:
+                return True
+            if direction == 'bear' and closes[j] >= mid:
+                return True
+        return False
+
+    # --- ORDER BLOCKS (přes displacement, nezávisle na FVG) ---
+    for i in range(1, n - 1):
+        if avg_body <= 0 or body[i] < avg_body * 1.5:
+            continue  # i = impulzní (displacement) svíčka
+        if closes[i] > opens[i]:
+            # bullish OB = poslední bearish svíčka před up-impulzem
+            for k in range(i - 1, max(-1, i - 6), -1):
+                if closes[k] < opens[k]:
+                    ob_t, ob_b = float(highs[k]), float(lows[k])
+                    if highs[i] <= ob_t:
+                        break  # impulz neprorazil nad OB → neplatné
+                    bull_ob.append({'top': ob_t, 'bot': ob_b, 'start_idx': idx[k],
+                                    'vol': float(vols[k]),
+                                    'mitigated': is_mitigated(ob_t, ob_b, i, 'bull')})
+                    break
+        elif closes[i] < opens[i]:
+            # bearish OB = poslední bullish svíčka před down-impulzem
+            for k in range(i - 1, max(-1, i - 6), -1):
+                if closes[k] > opens[k]:
+                    ob_t, ob_b = float(highs[k]), float(lows[k])
+                    if lows[i] >= ob_b:
                         break
-                        
-        # Bearish FVG & OB
-        if c_h < p2_l:
-            # FIRST TOUCH: Mitigace FVG hned při prvním dotyku knotem zdola (c_h)
-            mitigated = any(float(df['High'].iloc[j]) >= c_h for j in range(i + 1, len(df)))
-            if not mitigated:
-                bear_fvg.append({'top': p2_l, 'bot': c_h, 'start_idx': df.index[i-1]})
-                for k in range(i-2, max(0, i-7), -1):
-                    if float(df['Close'].iloc[k]) > float(df['Open'].iloc[k]): 
-                        ob_t, ob_b = float(df['High'].iloc[k]), float(df['Low'].iloc[k])
-                        # FIRST TOUCH: Mitigace OB dotykem zdola (ob_b)
-                        ob_mitig = any(float(df['High'].iloc[m]) >= ob_b for m in range(k + 1, len(df)))
-                        if not ob_mitig: 
-                            bear_ob.append({'top': ob_t, 'bot': ob_b, 'start_idx': df.index[k]})
-                        break
-                        
-    # PROXIMITY FILTER: Ponecháme jen 3 nejbližší zóny k aktuální ceně
-    bull_ob = sorted(bull_ob, key=lambda x: abs(current_price - x['top']))[:3]
-    bear_ob = sorted(bear_ob, key=lambda x: abs(current_price - x['bot']))[:3]
-    bull_fvg = sorted(bull_fvg, key=lambda x: abs(current_price - x['top']))[:3]
-    bear_fvg = sorted(bear_fvg, key=lambda x: abs(current_price - x['bot']))[:3]
-                        
+                    bear_ob.append({'top': ob_t, 'bot': ob_b, 'start_idx': idx[k],
+                                    'vol': float(vols[k]),
+                                    'mitigated': is_mitigated(ob_t, ob_b, i, 'bear')})
+                    break
+
+    # --- FVG (3-svíčkový gap) ---
+    for i in range(2, n):
+        if lows[i] > highs[i - 2]:  # bullish FVG
+            top, bot = float(lows[i]), float(highs[i - 2])
+            bull_fvg.append({'top': top, 'bot': bot, 'start_idx': idx[i - 1],
+                             'mitigated': is_mitigated(top, bot, i, 'bull')})
+        if highs[i] < lows[i - 2]:  # bearish FVG
+            top, bot = float(lows[i - 2]), float(highs[i])
+            bear_fvg.append({'top': top, 'bot': bot, 'start_idx': idx[i - 1],
+                             'mitigated': is_mitigated(top, bot, i, 'bear')})
+
+    def dedup(zones):
+        seen, out = set(), []
+        for z in zones:
+            key = (round(z['top'], 6), round(z['bot'], 6))
+            if key not in seen:
+                seen.add(key)
+                out.append(z)
+        return out
+
+    # FRESH FIRST + PROXIMITY: nezasažené zóny mají přednost, pak nejbližší k ceně
+    def rank(zones, edge):
+        zones = dedup(zones)
+        return sorted(zones, key=lambda z: (z.get('mitigated', False),
+                                            abs(current_price - z[edge])))[:3]
+
+    bull_ob = rank(bull_ob, 'top')
+    bear_ob = rank(bear_ob, 'bot')
+    bull_fvg = rank(bull_fvg, 'top')
+    bear_fvg = rank(bear_fvg, 'bot')
+
     return bull_fvg, bear_fvg, bull_ob, bear_ob
 
 async def smc_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1238,7 +1279,7 @@ async def smc_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(f"⏳ Kompletuji Premium SMC Profil pro *{ticker}*...", parse_mode="Markdown")
     
     try:
-        df = await asyncio.to_thread(yf.download, ticker, period="5d", interval="15m", progress=False)
+        df = await asyncio.to_thread(cached_yf_download, ticker, "5d", "15m")
         if df.empty: return await msg.edit_text(f"❌ Žádná data pro {ticker}.")
         if isinstance(df.columns, pd.MultiIndex):
             df = df[ticker] if ticker in df.columns.levels[0] else df.copy()
@@ -1283,10 +1324,17 @@ async def smc_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         def draw_zone(zones, color, border, name):
             for z in zones:
                 start_str = z['start_idx'].strftime(fmt)
-                fig.add_shape(type="rect", x0=start_str, x1=end_str, y0=z['bot'], y1=z['top'], 
-                              fillcolor=color, line=dict(color=border, width=1), layer="below")
-                fig.add_annotation(x=start_str, y=(z['top']+z['bot'])/2, text=name, showarrow=False, 
-                                   font=dict(color=border, size=10), xanchor="left")
+                used = z.get('mitigated', False)
+                # Zasažené (mitigated) zóny kreslíme slabší a přerušovaně, aby čerstvé vynikly.
+                fill = color.replace("0.25", "0.08").replace("0.1", "0.04") if used else color
+                lbl = f"{name}·" if used else name
+                fig.add_shape(type="rect", x0=start_str, x1=end_str, y0=z['bot'], y1=z['top'],
+                              fillcolor=fill,
+                              line=dict(color=border, width=1, dash="dot" if used else "solid"),
+                              layer="below")
+                fig.add_annotation(x=start_str, y=(z['top']+z['bot'])/2, text=lbl, showarrow=False,
+                                   font=dict(color=border, size=10), xanchor="left",
+                                   opacity=0.45 if used else 1.0)
 
         draw_zone(bull_ob, "rgba(76, 175, 80, 0.25)", "#4CAF50", "+OB")
         draw_zone(bear_ob, "rgba(244, 67, 54, 0.25)", "#F44336", "-OB")
@@ -1313,13 +1361,53 @@ async def smc_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         png = fig.to_image(format="png")
         
         pd_status = "🔴 Premium" if current_price > eq_level else "🟢 Discount"
+
+        # --- AKČNÍ VÝSTUP: nejbližší čerstvé OB + entry/stop/target + RR ---
+        fresh_bull = [z for z in bull_ob if not z.get('mitigated')]
+        fresh_bear = [z for z in bear_ob if not z.get('mitigated')]
+
+        # Je cena PRÁVĚ TEĎ v nějaké čerstvé zóně?
+        in_zone = None
+        for z in fresh_bull:
+            if z['bot'] <= current_price <= z['top']:
+                in_zone = ("LONG 🟢", z); break
+        if not in_zone:
+            for z in fresh_bear:
+                if z['bot'] <= current_price <= z['top']:
+                    in_zone = ("SHORT 🔴", z); break
+
+        # Nejbližší poptávkový OB pod cenou (LONG) a nabídkový nad cenou (SHORT)
+        demand = sorted([z for z in fresh_bull if z['top'] <= current_price],
+                        key=lambda z: current_price - z['top'])
+        supply = sorted([z for z in fresh_bear if z['bot'] >= current_price],
+                        key=lambda z: z['bot'] - current_price)
+
+        akce = []
+        if in_zone:
+            side, z = in_zone
+            akce.append(f"⚡ *Cena je TEĎ v {side} OB* `${z['bot']:.2f}–{z['top']:.2f}`")
+        if demand:
+            z = demand[0]
+            entry, stop, target = z['top'], z['bot'], recent_high
+            rr = (target - entry) / (entry - stop) if (entry - stop) > 0 else 0
+            akce.append(f"🟢 *LONG OB:* `${z['bot']:.2f}–{z['top']:.2f}` → 🎯 `${target:.2f}` _(RR {rr:.1f})_")
+        if supply:
+            z = supply[0]
+            entry, stop, target = z['bot'], z['top'], recent_low
+            rr = (entry - target) / (stop - entry) if (stop - entry) > 0 else 0
+            akce.append(f"🔴 *SHORT OB:* `${z['bot']:.2f}–{z['top']:.2f}` → 🎯 `${target:.2f}` _(RR {rr:.1f})_")
+        akce_text = "\n".join(akce) if akce else "_Žádné čerstvé OB poblíž ceny._"
+
         text_zpravy = (
             f"🎯 *Premium SMC Profil: {ticker} (15m)*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚖️ *P/D Zóna:* `{pd_status}`\n"
-            f"🎯 *Klíčové aktivní OBs:* `Bull {len(bull_ob)} | Bear {len(bear_ob)}`\n"
+            f"💵 *Cena:* `${current_price:.2f}`  |  ⚖️ *P/D:* `{pd_status}`\n"
+            f"🎯 *Čerstvé OB:* `Bull {len(fresh_bull)} | Bear {len(fresh_bear)}` "
+            f"_(celkem {len(bull_ob)}/{len(bear_ob)})_\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 _Graf nyní ukazuje čisté a přesné zóny. Začínají na svíčce svého vzniku a filtrují jen ty nejsilnější (Displacement)._\n"
+            f"{akce_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 _Slabší přerušované zóny = už zasažené. RR cílí na BSL/SSL likviditu._\n"
             f"⚡ _Sniper alert:_ `/sniper {ticker}`"
         )
         
@@ -1381,12 +1469,16 @@ async def sniper_background_task(context: ContextTypes.DEFAULT_TYPE):
                 
                 alert_msg = ""
                 for ob in bull_ob:
+                    if ob.get('mitigated'):
+                        continue  # už zasažený OB nealertujeme
                     if current_low <= ob['top'] and current_price >= ob['bot']:
-                        alert_msg = f"🟢 *LONG ALERT ({ticker})*\nCena propíchla Bullish Order Block (`${ob['top']:.2f}`). Hledej long!"
+                        alert_msg = f"🟢 *LONG ALERT ({ticker})*\nCena propíchla čerstvý Bullish Order Block (`${ob['top']:.2f}`). Hledej long!"
                         break
                 for ob in bear_ob:
+                    if ob.get('mitigated'):
+                        continue
                     if current_high >= ob['bot'] and current_price <= ob['top']:
-                        alert_msg = f"🔴 *SHORT ALERT ({ticker})*\nCena zasáhla Bearish Order Block (`${ob['bot']:.2f}`). Hledej short!"
+                        alert_msg = f"🔴 *SHORT ALERT ({ticker})*\nCena zasáhla čerstvý Bearish Order Block (`${ob['bot']:.2f}`). Hledej short!"
                         break
 
                 if alert_msg:
