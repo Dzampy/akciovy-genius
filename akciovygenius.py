@@ -24,6 +24,10 @@ pio.kaleido.scope.chromium_args += ("--no-sandbox", "--disable-dev-shm-usage")
 from mtf_analysis import analyze_mtf_levels, format_level, format_zone, make_mtf_chart
 from dotenv import load_dotenv
 
+print("\n" + "="*50)
+print("🚀 [TEST] WEBHOOK FUNGUJE! Nová verze je nasazena!")
+print("="*50 + "\n")
+
 # Tvoje natvrdo zadané klíče
 TOKEN = "8825645830:AAGat5gPqE16QUe2W_UQ4SrlzpyBEa10daU" 
 AV_KEY ="Q3UCP540D9VVDBBI"
