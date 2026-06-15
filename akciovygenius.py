@@ -79,6 +79,22 @@ WHALE_MIN_AGGR = float(os.getenv("WHALE_MIN_AGGR", "0.6"))             # min. ag
 WHALE_CHUNK = int(os.getenv("WHALE_CHUNK", "12"))                      # tickerů na jeden cyklus
 WHALE_MAX_ALERTS = int(os.getenv("WHALE_MAX_ALERTS", "5"))             # max alertů na cyklus
 
+# ── Skenery: sdílená konkurence a throttling ──────────────────────────────────
+# Jednotné parametry pro všechny hromadné skeny (whale radar, /nasdaq, /darkhorse, /whales).
+SCAN_CONCURRENCY = int(os.getenv("SCAN_CONCURRENCY", "3"))     # paralelních tasků naráz
+SCAN_DELAY_CHART = float(os.getenv("SCAN_DELAY_CHART", "1.0")) # rozestup u chart skenů (/nasdaq, /darkhorse)
+SCAN_DELAY_FLOW = float(os.getenv("SCAN_DELAY_FLOW", "0.5"))   # rozestup u options-flow skenů (/whales, radar)
+
+# ── Options-flow prahy ────────────────────────────────────────────────────────
+# Filtry pro detekci neobvyklé opční aktivity (analyze_options_flow).
+OPT_MIN_VOL = int(os.getenv("OPT_MIN_VOL", "100"))            # min. denní objem kontraktů
+OPT_MIN_OI = int(os.getenv("OPT_MIN_OI", "1"))               # min. open interest (děleno → != 0)
+OPT_MIN_VOL_OI = float(os.getenv("OPT_MIN_VOL_OI", "3.0"))   # min. poměr volume/OI (unusual)
+OPT_MIN_PREMIUM = float(os.getenv("OPT_MIN_PREMIUM", "50000"))  # min. prémie bloku ($)
+OPT_MAX_EXPIRATIONS = int(os.getenv("OPT_MAX_EXPIRATIONS", "15"))  # kolik nejbližších expirací projít
+OPT_DTE_MIN = int(os.getenv("OPT_DTE_MIN", "7"))             # min. dní do expirace
+OPT_DTE_MAX = int(os.getenv("OPT_DTE_MAX", "90"))            # max. dní do expirace
+
 _WHALE_RADAR_FILE = "whale_radar.json"
 whale_radar_chats: set = set()     # chat_id odběratelů radaru (perzistované)
 _whale_scan_idx = 0                # rotující ukazatel do univerza tickerů
@@ -266,6 +282,32 @@ async def safe_send(bot, chat_id: str, text: str) -> None:
             )
         except Exception as e:
             log.error("safe_send selhal i jako plain text (chat %s): %s", chat_id, e)
+
+
+async def scan_universe(tickers, worker, *, concurrency=SCAN_CONCURRENCY, delay=1.0):
+    """Sjednocený paralelní sken seznamu tickerů.
+
+    Spustí `worker(ticker)` pro každý ticker s omezenou konkurencí (`concurrency`)
+    a rozestupem `delay` sekund mezi starty (šetří yfinance rate-limit). `worker`
+    smí být sync i async — sync se automaticky odsune do vlákna. Výjimka v jednom
+    workeru se zaloguje a vrátí None (ostatní pokračují). Vrací seznam výsledků
+    ve stejném pořadí jako `tickers`.
+    """
+    sem = asyncio.Semaphore(concurrency)
+
+    async def run(tk):
+        async with sem:
+            await asyncio.sleep(delay)
+            try:
+                if asyncio.iscoroutinefunction(worker):
+                    return await worker(tk)
+                return await asyncio.to_thread(worker, tk)
+            except Exception as e:
+                log.debug("[SCAN] %s chyba: %s", tk, e)
+                return None
+
+    return await asyncio.gather(*[run(tk) for tk in tickers])
+
 
 async def reply_long(message, text: str, parse_mode: str = "Markdown") -> None:
     """Pošle text rozdělený na kusy do 4096 znaků. Když selže Markdown, zkusí plain text."""
@@ -996,12 +1038,12 @@ def analyze_options_flow(ticker: str, spot: float) -> tuple[list[dict], float]:
     today = datetime.now(timezone.utc).date()
     agg: dict[tuple, dict] = {}
 
-    for exp_str in expirations[:15]:
+    for exp_str in expirations[:OPT_MAX_EXPIRATIONS]:
         try: exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
         except ValueError: continue
-            
+
         dte = (exp_date - today).days
-        if not (7 <= dte <= 90): continue
+        if not (OPT_DTE_MIN <= dte <= OPT_DTE_MAX): continue
 
         try: chain = tk.option_chain(exp_str)
         except Exception: continue
@@ -1019,9 +1061,9 @@ def analyze_options_flow(ticker: str, spot: float) -> tuple[list[dict], float]:
                 iv_raw = _safe(row.get("impliedVolatility"))
                 strike = _safe(row.get("strike"))
                 
-                if iv_raw > 5 or vol < 100 or oi < 1 or last <= 0 or (vol / oi < 3.0): continue
+                if iv_raw > 5 or vol < OPT_MIN_VOL or oi < OPT_MIN_OI or last <= 0 or (vol / oi < OPT_MIN_VOL_OI): continue
                 premium = vol * last * 100
-                if premium < 50_000: continue
+                if premium < OPT_MIN_PREMIUM: continue
 
                 mon_label, delta_w = moneyness(strike, spot, opt_type)
                 aggr   = aggression_score(last, bid, ask)
@@ -1298,19 +1340,8 @@ async def whale_radar_loop(context: ContextTypes.DEFAULT_TYPE):
         chunk += universe[:WHALE_CHUNK - len(chunk)]
     _whale_scan_idx = (start + WHALE_CHUNK) % len(universe)
 
-    sem = asyncio.Semaphore(3)
-
-    async def scan(tk: str):
-        async with sem:
-            await asyncio.sleep(0.4)                   # šetrné k yfinance rate-limitu
-            try:
-                return await asyncio.to_thread(scan_ticker_whales, tk)
-            except Exception as e:
-                log.debug("[WHALE] %s chyba: %s", tk, e)
-                return []
-
-    results = await asyncio.gather(*[scan(t) for t in chunk])
-    alerts = [a for sub in results for a in sub]
+    results = await scan_universe(chunk, scan_ticker_whales, delay=SCAN_DELAY_FLOW)
+    alerts = [a for sub in results if sub for a in sub]
     fresh = [a for a in alerts if _whale_dedup_ok(a["key"])]
     if not fresh:
         return
@@ -2101,36 +2132,28 @@ async def nasdaq_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    sem = asyncio.Semaphore(3)
-    
-    async def analyze_for_nasdaq(ticker):
-        async with sem:
-            await asyncio.sleep(1.5)
-            try:
-                result = await asyncio.to_thread(make_chart, ticker, "1d", False, False)
-                if not result: return None
-                _, _, data = result
-                if not data: return None
+    def analyze_for_nasdaq(ticker):
+        result = make_chart(ticker, "1d", False, False)
+        if not result: return None
+        _, _, data = result
+        if not data: return None
 
-                if "No Setup" in data["setup_type"]: return None
-                if data["score"] <= 0: return None
+        if "No Setup" in data["setup_type"]: return None
+        if data["score"] <= 0: return None
 
-                return {
-                    "ticker": ticker,
-                    "type": data["setup_type"].replace("🟢 ", "").replace("🚀 ", ""),
-                    "score": data["score"],
-                    "sm": data["sm"],
-                    "entry": data["entry"],
-                    "stop": f"${data['stop']:.2f}",
-                    "t1": f"${data['t1']:.2f}",
-                    "rr": f"1:{data['rr_zone']:.1f}",
-                }
-            except Exception:
-                return None
+        return {
+            "ticker": ticker,
+            "type": data["setup_type"].replace("🟢 ", "").replace("🚀 ", ""),
+            "score": data["score"],
+            "sm": data["sm"],
+            "entry": data["entry"],
+            "stop": f"${data['stop']:.2f}",
+            "t1": f"${data['t1']:.2f}",
+            "rr": f"1:{data['rr_zone']:.1f}",
+        }
 
-    tasks = [analyze_for_nasdaq(ticker) for ticker in NASDAQ_100]
-    raw_results = await asyncio.gather(*tasks)
-    
+    raw_results = await scan_universe(NASDAQ_100, analyze_for_nasdaq, delay=SCAN_DELAY_CHART)
+
     valid_setups = [r for r in raw_results if r is not None]
     valid_setups.sort(key=lambda x: x["score"], reverse=True)
     top_10 = valid_setups[:10]
@@ -2165,39 +2188,32 @@ async def darkhorse_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: await asyncio.to_thread(yf.download, "SPY", period="1d", progress=False)
     except Exception: pass
 
-    sem = asyncio.Semaphore(3) 
+    def scan_darkhorse(ticker):
+        result = make_chart(ticker, "1d", False, False)
+        if not result: return None
 
-    async def scan_darkhorse(ticker):
-        async with sem:
-            await asyncio.sleep(1.5) 
-            try:
-                result = await asyncio.to_thread(make_chart, ticker, "1d", False, False)
-                if not result: return None
+        _, _, data = result
+        if not data: return None
+        if "No Setup" in data["setup_type"]: return None
 
-                _, _, data = result
-                if not data: return None
-                if "No Setup" in data["setup_type"]: return None
+        score = data["score"]
+        if score < 70: return None
 
-                score = data["score"]
-                if score < 70: return None
+        rr_zone = data["rr_zone"]
+        if rr_zone < 2.0: return None
 
-                rr_zone = data["rr_zone"]
-                if rr_zone < 2.0: return None
+        sm_score = data["sm"]
+        mom_norm = 1.0 if data["mom_ok"] else 0.0
+        vol_norm = 1.0 if data["vol_ok"] else 0.0
 
-                sm_score = data["sm"]
-                mom_norm = 1.0 if data["mom_ok"] else 0.0
-                vol_norm = 1.0 if data["vol_ok"] else 0.0
+        score_norm = score / 100.0
+        rr_norm = min(rr_zone, 10.0) / 10.0
+        dh_score = (score_norm * 0.4 + rr_norm * 0.3 + mom_norm * 0.2 + vol_norm * 0.1) * 100
 
-                score_norm = score / 100.0
-                rr_norm = min(rr_zone, 10.0) / 10.0
-                dh_score = (score_norm * 0.4 + rr_norm * 0.3 + mom_norm * 0.2 + vol_norm * 0.1) * 100
+        return {"ticker": ticker, "score": score, "sm": sm_score, "rr": rr_zone, "dh_score": dh_score}
 
-                return {"ticker": ticker, "score": score, "sm": sm_score, "rr": rr_zone, "dh_score": dh_score}
-            except Exception: return None
+    raw_results = await scan_universe(watchlist, scan_darkhorse, delay=SCAN_DELAY_CHART)
 
-    tasks = [scan_darkhorse(ticker) for ticker in watchlist]
-    raw_results = await asyncio.gather(*tasks)
-    
     valid_setups = [r for r in raw_results if r is not None]
     valid_setups.sort(key=lambda x: x["dh_score"], reverse=True)
     top_10 = valid_setups[:10]
@@ -2250,15 +2266,7 @@ async def whales_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    sem = asyncio.Semaphore(3)
-    
-    async def safe_get_flow(ticker):
-        async with sem:
-            await asyncio.sleep(0.5)
-            return await get_net_whale_flow(ticker)
-
-    tasks = [safe_get_flow(ticker) for ticker in watchlist]
-    raw_results = await asyncio.gather(*tasks)
+    raw_results = await scan_universe(watchlist, get_net_whale_flow, delay=SCAN_DELAY_FLOW)
 
     valid_results = [r for r in raw_results if r is not None and r["net_flow"] != 0]
     zero_count = len(watchlist) - len(valid_results)
