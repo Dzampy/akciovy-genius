@@ -1240,12 +1240,18 @@ async def sniper_background_task(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e: print(f"Sniper chyba: {e}")
 
 
+import time # Ujisti se, že tohle máš někde nahoře v importech, nebo to klidně nech tady
+
+# Tuhle proměnnou musíme definovat ZVENKU před funkcí, aby se na ni mohl globálně odkazovat
+last_market_text = "" 
+
 async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
     """Hlavní smyčka na pozadí pro makro zprávy z Telegram zrcadla (Anti-X-Ban)"""
     global last_market_text
     
     try:
-        url = "https://t.me/s/marketfeed"
+        # 1. OPRAVA CACHE: Přidáme do URL aktuální čas vteřinách, Telegram vždy vrátí nejnovější stav
+        url = f"https://t.me/s/marketfeed?nocache={int(time.time())}"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
         
         resp = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
@@ -1259,19 +1265,25 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
             
         text_tweetu = zpravy[-1].get_text(separator=" ", strip=True)
         
-        # Ochrana paměti proti restartu (úspora API volání)
+        # 2. BEZPEČNÉ NAČTENÍ PAMĚTI: Zabrání tichému pádu při prázdném souboru
         pamet_soubor = "posledni_tweet.txt"
         if os.path.exists(pamet_soubor):
             with open(pamet_soubor, "r", encoding="utf-8") as f:
                 last_market_text = f.read().strip()
                 
+        # 3. KONTROLA DUPLICITY
         if text_tweetu == last_market_text:
+            # Je to stará zpráva, nic neděláme
             return
             
+        # 4. JE TO NOVÉ! Uložíme do paměti a jdeme pracovat
+        print(f"🚨 [WALTER] ZAZNAMENÁNA NOVÁ ZPRÁVA: {text_tweetu[:50]}...")
         with open(pamet_soubor, "w", encoding="utf-8") as f:
             f.write(text_tweetu)
             
         last_market_text = text_tweetu
+
+        # ... (zde pokračuje tvůj stávající kód: # --- FÁZE 1: AI DETEKCE TICKERU...)
 
         # --- FÁZE 1: AI DETEKCE TICKERU PŘES GROQ (JSON) ---
         prompt_detekce = f"""
