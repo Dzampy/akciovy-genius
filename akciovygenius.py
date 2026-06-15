@@ -18,6 +18,7 @@ import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Conflict, NetworkError
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 from plotly.subplots import make_subplots
 import plotly.io as pio
@@ -2129,6 +2130,21 @@ async def ai_pdf_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 # 5. START BOTA
 # ==============================================================================
+async def error_handler(update, context):
+    """Globální zachytávač chyb — ať jedna výjimka neshodí bota ani nespamuje traceback."""
+    err = context.error
+    if isinstance(err, Conflict):
+        # Dvě instance bota se stejným tokenem se perou o getUpdates.
+        # Bývá to přechodné (rolling deploy) — loguj stručně, neřeš tracebackem.
+        log.warning("⚠️ Conflict: běží jiná instance bota se stejným tokenem (getUpdates). "
+                    "Zkontroluj, že běží jen JEDNA instance.")
+        return
+    if isinstance(err, NetworkError):
+        log.warning("Síťová chyba (přechodná): %s", err)
+        return
+    log.error("Neošetřená výjimka v handleru: %s", err, exc_info=err)
+
+
 def main():
     if not TOKEN:
         log.error("CHYBA: Chybí TELEGRAM_TOKEN! Nastav ho v .env souboru.")
@@ -2160,6 +2176,9 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ticker))
 
+    # Globální error handler (mj. tiší spam z Conflict při překryvu instancí)
+    app.add_error_handler(error_handler)
+
     # Naplánuj SMC Sniper skener na pozadí (každou minutu), pokud je JobQueue dostupná
     if app.job_queue:
         app.job_queue.run_repeating(sniper_background_task, interval=60, first=15, name="sniper_job")
@@ -2167,7 +2186,8 @@ def main():
         log.warning("JobQueue není dostupná – SMC Sniper poběží jen po /sniper. Nainstaluj python-telegram-bot[job-queue].")
 
     log.info("✅ Bot běží. Zastav pomocí Ctrl+C.")
-    app.run_polling()
+    # drop_pending_updates=True → po restartu zahodí nahromaděný backlog (čistší start)
+    app.run_polling(drop_pending_updates=True)
     
 if __name__ == "__main__":
     main()
