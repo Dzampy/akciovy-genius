@@ -849,6 +849,7 @@ def make_sr_chart(ticker: str, interval: str):
 # ==============================================================================
 # Čisté (bezsíťové) scoring funkce → testovatelné a identické živě i v testech.
 # Každá kategorie vrací 0–100 sub-skóre; písmenná známka se odvozuje z _letter_grade.
+# Ke každé kategorii se přidává „note" = vysvětlení lidskou řečí (pro začátečníky).
 
 def _fmt_big(val) -> str:
     """Formátuje velká USD čísla (T/B/M/K)."""
@@ -888,40 +889,86 @@ def _avg(vals):
     vals = [v for v in vals if v is not None]
     return sum(vals) / len(vals) if vals else None
 
+# Vysvětlení každé kategorie lidskou řečí podle dosaženého skóre (5 pásem).
+_CAT_NOTES = {
+    "growth":   ["Tržby i zisk klesají — varovný signál.",
+                 "Růst zpomaluje, byznys spíš stagnuje.",
+                 "Růst je vlažný, nic extra.",
+                 "Slušný růst, firma se rozšiřuje.",
+                 "Roste svižně — tržby i zisk míří nahoru."],
+    "profit":   ["Firma vydělává málo, nebo je ztrátová.",
+                 "Tenké marže, moc jí nezbývá.",
+                 "Marže jsou průměrné.",
+                 "Zdravě zisková firma.",
+                 "Mimořádně zisková — z každého dolaru tržeb si nechá hodně."],
+    "balance":  ["Hodně dluhů a slabá likvidita — rizikové.",
+                 "Vyšší zadlužení, sleduj to.",
+                 "Rozvaha je v normě.",
+                 "Finančně zdravá, dluh pod kontrolou.",
+                 "Pevná rozvaha — málo dluhů, dost hotovosti."],
+    "value":    ["Hodně drahá — v ceně sedí velká očekávání.",
+                 "Spíš drahá, platíš prémii.",
+                 "Oceněná férově — ani levná, ani drahá.",
+                 "Cena je rozumná vůči číslům.",
+                 "Levná vůči svým číslům — atraktivní vstup."],
+    "cashflow": ["Pálí hotovost — reálně peníze nevydělává.",
+                 "Slabý cash flow.",
+                 "Cash flow je v pohodě.",
+                 "Zdravý volný cash flow.",
+                 "Silný volný cash flow — reálné peníze do pokladny."],
+}
 
-def score_growth(rev_g, eps_g) -> dict:
-    """Růst: meziroční tržby + EPS (v %)."""
+def _cat_note(kind: str, score) -> str:
+    if score is None:
+        return "Chybí data k vyhodnocení."
+    notes = _CAT_NOTES[kind]
+    if score >= 78: i = 4
+    elif score >= 65: i = 3
+    elif score >= 50: i = 2
+    elif score >= 35: i = 1
+    else: i = 0
+    return notes[i]
+
+
+def score_growth(rev_g, eps_g, q_g=None) -> dict:
+    """Růst: meziroční tržby + EPS + poslední kvartál (vše v %)."""
     comps, parts = [], []
     if rev_g is not None:
         comps.append(_band_high(rev_g, [(30, 100), (20, 88), (12, 75), (6, 60), (0, 45), (-8, 28)], 12))
-        parts.append(f"Tržby YoY {rev_g:+.0f}%")
+        parts.append(f"Tržby {rev_g:+.0f}%")
     if eps_g is not None:
         comps.append(_band_high(eps_g, [(30, 100), (18, 85), (8, 70), (0, 52), (-10, 30)], 12))
-        parts.append(f"EPS YoY {eps_g:+.0f}%")
+        parts.append(f"Zisk {eps_g:+.0f}%")
+    if q_g is not None:
+        comps.append(_band_high(q_g, [(25, 100), (12, 80), (3, 62), (0, 48), (-10, 28)], 12))
+        parts.append(f"Q {q_g:+.0f}%")
     sc = _avg(comps)
-    return {"score": sc, "grade": _letter_grade(sc), "parts": parts}
+    return {"score": sc, "grade": _letter_grade(sc), "parts": parts, "note": _cat_note("growth", sc)}
 
 
-def score_profitability(net_m, oper_m, gross_m, roe) -> dict:
-    """Ziskovost: marže (v %) + ROE (desetinné, 0.15 = 15 %)."""
+def score_profitability(net_m, oper_m, gross_m, roe, roa=None) -> dict:
+    """Ziskovost: marže (v %) + ROE/ROA (desetinné, 0.15 = 15 %)."""
     comps, parts = [], []
     if net_m is not None:
         comps.append(_band_high(net_m, [(25, 100), (15, 85), (8, 70), (3, 55), (0, 42), (-5, 22)], 8))
-        parts.append(f"Čistá {net_m:.0f}%")
+        parts.append(f"Čistá marže {net_m:.0f}%")
     if oper_m is not None:
         comps.append(_band_high(oper_m, [(30, 100), (20, 85), (12, 70), (5, 55), (0, 40)], 20))
         parts.append(f"Provozní {oper_m:.0f}%")
     if roe is not None:
         comps.append(_band_high(roe * 100, [(25, 100), (15, 82), (8, 65), (0, 45)], 20))
         parts.append(f"ROE {roe*100:.0f}%")
+    if roa is not None:
+        comps.append(_band_high(roa * 100, [(15, 100), (8, 82), (4, 65), (0, 45)], 20))
+        parts.append(f"ROA {roa*100:.0f}%")
     if gross_m is not None:
         parts.append(f"Hrubá {gross_m:.0f}%")
     sc = _avg(comps)
-    return {"score": sc, "grade": _letter_grade(sc), "parts": parts}
+    return {"score": sc, "grade": _letter_grade(sc), "parts": parts, "note": _cat_note("profit", sc)}
 
 
-def score_balance(d_e, curr, cash, debt) -> dict:
-    """Rozvaha: dluh/equity (poměr), current ratio, čistá hotovost vs dluh."""
+def score_balance(d_e, curr, cash, debt, quick=None) -> dict:
+    """Rozvaha: dluh/equity (poměr), current/quick ratio, čistá hotovost vs dluh."""
     comps, parts = [], []
     if d_e is not None:
         comps.append(_band_low(d_e, [(0.3, 100), (0.5, 88), (1.0, 72), (1.5, 55), (2.5, 35)], 18))
@@ -929,17 +976,20 @@ def score_balance(d_e, curr, cash, debt) -> dict:
     if curr is not None:
         comps.append(_band_high(curr, [(2.0, 100), (1.5, 82), (1.2, 68), (1.0, 52)], 30))
         parts.append(f"Current {curr:.2f}")
+    if quick is not None:
+        comps.append(_band_high(quick, [(1.5, 100), (1.0, 82), (0.7, 64), (0.4, 48)], 30))
+        parts.append(f"Quick {quick:.2f}")
     if cash is not None and debt is not None:
         ratio = cash / debt if debt > 0 else 5.0
         comps.append(_band_high(ratio, [(1.0, 95), (0.5, 72), (0.25, 55), (0.1, 40)], 25))
         net = cash - debt
         parts.append(f"Net {'hotovost' if net >= 0 else 'dluh'} {_fmt_big(abs(net))}")
     sc = _avg(comps)
-    return {"score": sc, "grade": _letter_grade(sc), "parts": parts}
+    return {"score": sc, "grade": _letter_grade(sc), "parts": parts, "note": _cat_note("balance", sc)}
 
 
-def score_valuation(pe, ps, peg) -> dict:
-    """Valuace: P/E, P/S, PEG — nižší = levnější = VYŠŠÍ skóre (atraktivnější)."""
+def score_valuation(pe, ps, peg, pb=None, ev_ebitda=None) -> dict:
+    """Valuace: P/E, P/S, PEG, P/B, EV/EBITDA — nižší = levnější = VYŠŠÍ skóre."""
     comps, parts = [], []
     if pe is not None and pe > 0:
         comps.append(_band_low(pe, [(12, 100), (18, 82), (25, 66), (35, 50), (50, 33)], 18))
@@ -950,21 +1000,29 @@ def score_valuation(pe, ps, peg) -> dict:
     if peg is not None and peg > 0:
         comps.append(_band_low(peg, [(1.0, 100), (1.5, 80), (2.0, 62), (3.0, 42)], 25))
         parts.append(f"PEG {peg:.2f}")
+    if pb is not None and pb > 0:
+        comps.append(_band_low(pb, [(1.5, 100), (3, 82), (6, 62), (10, 45), (20, 30)], 18))
+        parts.append(f"P/B {pb:.1f}")
+    if ev_ebitda is not None and ev_ebitda > 0:
+        comps.append(_band_low(ev_ebitda, [(8, 100), (12, 82), (18, 64), (28, 46), (40, 30)], 18))
+        parts.append(f"EV/EBITDA {ev_ebitda:.0f}")
     sc = _avg(comps)
-    return {"score": sc, "grade": _letter_grade(sc), "parts": parts}
+    return {"score": sc, "grade": _letter_grade(sc), "parts": parts, "note": _cat_note("value", sc)}
 
 
-def score_cashflow(fcf, fcf_margin) -> dict:
-    """Cash flow: volný cash flow (USD) a jeho marže (% z tržeb)."""
+def score_cashflow(fcf, fcf_margin, ocf=None) -> dict:
+    """Cash flow: volný cash flow (USD), jeho marže (% z tržeb), provozní CF."""
     comps, parts = [], []
     if fcf is not None:
         comps.append(80 if fcf > 0 else 20)
         parts.append(f"FCF {_fmt_big(fcf)}")
     if fcf_margin is not None:
         comps.append(_band_high(fcf_margin, [(20, 100), (12, 85), (6, 68), (0, 48), (-5, 25)], 10))
-        parts.append(f"Marže {fcf_margin:.0f}%")
+        parts.append(f"FCF marže {fcf_margin:.0f}%")
+    if ocf is not None:
+        parts.append(f"Provozní CF {_fmt_big(ocf)}")
     sc = _avg(comps)
-    return {"score": sc, "grade": _letter_grade(sc), "parts": parts}
+    return {"score": sc, "grade": _letter_grade(sc), "parts": parts, "note": _cat_note("cashflow", sc)}
 
 
 def invest_profile(growth, profit, balance, value, cashflow, trend, upside) -> dict:
@@ -1000,6 +1058,41 @@ def invest_profile(growth, profit, balance, value, cashflow, trend, upside) -> d
             "trend": trend, "analyst": analyst, "verdict": verdict, "desc": desc}
 
 
+# ── Pomocné popisky pro „snímek firmy" (beginner-friendly) ───────────────────
+
+def _cap_label(mcap) -> str:
+    if mcap is None: return ""
+    if mcap >= 200e9: return "Mega-cap"
+    if mcap >= 10e9:  return "Large-cap"
+    if mcap >= 2e9:   return "Mid-cap"
+    if mcap >= 300e6: return "Small-cap"
+    return "Micro-cap"
+
+def _beta_label(beta) -> str:
+    if beta is None: return ""
+    if beta < 0.8:  return f"Nízká kolísavost (klidná, beta {beta:.2f})"
+    if beta < 1.2:  return f"Střední kolísavost (beta {beta:.2f})"
+    if beta < 1.8:  return f"Vyšší kolísavost (beta {beta:.2f})"
+    return f"Vysoká kolísavost (divoká, beta {beta:.2f})"
+
+def _range_bar(price, low, high) -> str:
+    """Mini ukazatel pozice ceny v ročním rozpětí (12 polí)."""
+    if None in (price, low, high) or high <= low:
+        return ""
+    pos = max(0.0, min(1.0, (price - low) / (high - low)))
+    idx = round(pos * 11)
+    bar = "─" * idx + "●" + "─" * (11 - idx)
+    from_high = (high - price) / high * 100
+    return f"${low:.0f} {bar} ${high:.0f}  ({from_high:+.0f}% od max)"
+
+def _rec_label(key) -> str:
+    return {
+        "strong_buy": "💚 Silně koupit", "buy": "🟢 Koupit",
+        "hold": "🟡 Držet", "underperform": "🟠 Spíš prodat",
+        "sell": "🔴 Prodat",
+    }.get((key or "").lower(), "")
+
+
 def _gather_fundamentals(ticker: str) -> dict:
     """Stáhne fundamenty z yfinance, převede jednotky a spočítá všechny kategorie."""
     tk = yf.Ticker(ticker)
@@ -1018,19 +1111,25 @@ def _gather_fundamentals(ticker: str) -> dict:
 
     rev_g = pct("revenueGrowth")
     eps_g = pct("earningsGrowth")
+    q_g = pct("earningsQuarterlyGrowth")
     net_m = pct("profitMargins")
     oper_m = pct("operatingMargins")
     gross_m = pct("grossMargins")
     roe = num("returnOnEquity")
+    roa = num("returnOnAssets")
     d_e_raw = num("debtToEquity")
     d_e = d_e_raw / 100 if d_e_raw is not None else None   # yfinance dává v %
     curr = num("currentRatio")
+    quick = num("quickRatio")
     cash = num("totalCash")
     debt = num("totalDebt")
     pe = num("trailingPE")
     ps = num("priceToSalesTrailing12Months")
     peg = num("trailingPegRatio") or num("pegRatio")
+    pb = num("priceToBook")
+    ev_ebitda = num("enterpriseToEbitda")
     fcf = num("freeCashflow")
+    ocf = num("operatingCashflow")
     rev = num("totalRevenue")
     fcf_margin = (fcf / rev * 100) if (fcf is not None and rev) else None
     price = num("currentPrice")
@@ -1043,16 +1142,23 @@ def _gather_fundamentals(ticker: str) -> dict:
         diff = (price - dma200) / dma200 * 100
         trend = _band_high(diff, [(15, 90), (5, 72), (0, 58), (-8, 40), (-20, 22)], 12)
 
+    div_yield = num("dividendYield")        # už v % (0.37 = 0.37 %)
+    payout = num("payoutRatio")
+
     return {
         "ticker": ticker.upper(),
         "name": info.get("shortName") or info.get("longName") or ticker.upper(),
         "sector": info.get("sector"),
+        "market_cap": num("marketCap"), "beta": num("beta"),
         "price": price, "target": target, "upside": upside, "trend": trend,
-        "growth": score_growth(rev_g, eps_g),
-        "profit": score_profitability(net_m, oper_m, gross_m, roe),
-        "balance": score_balance(d_e, curr, cash, debt),
-        "value": score_valuation(pe, ps, peg),
-        "cashflow": score_cashflow(fcf, fcf_margin),
+        "wk_low": num("fiftyTwoWeekLow"), "wk_high": num("fiftyTwoWeekHigh"),
+        "rec": info.get("recommendationKey"), "n_analysts": num("numberOfAnalystOpinions"),
+        "div_yield": div_yield, "payout": payout, "forward_pe": num("forwardPE"),
+        "growth": score_growth(rev_g, eps_g, q_g),
+        "profit": score_profitability(net_m, oper_m, gross_m, roe, roa),
+        "balance": score_balance(d_e, curr, cash, debt, quick),
+        "value": score_valuation(pe, ps, peg, pb, ev_ebitda),
+        "cashflow": score_cashflow(fcf, fcf_margin, ocf),
     }
 
 
@@ -1066,6 +1172,8 @@ def format_fundamentals(data: dict) -> str:
     prof = _build_profile(data)
     t = data["ticker"]
     sector = data.get("sector") or "—"
+    cap = _cap_label(data.get("market_cap"))
+    head_sub = " · ".join(x for x in [data["name"], sector, cap] if x)
 
     def cat_line(emoji, label, cat):
         g = cat["grade"]
@@ -1073,7 +1181,8 @@ def format_fundamentals(data: dict) -> str:
         sc_str = f"{sc:.0f}" if sc is not None else "—"
         detail = "  ·  ".join(cat["parts"]) if cat["parts"] else "data N/A"
         return (f"{emoji} *{label}*  {_grade_icon(g)} `{g}`  _{sc_str}/100_\n"
-                f"     _{detail}_")
+                f"     {detail}\n"
+                f"     → _{cat['note']}_")
 
     overall = prof["overall"]
     overall_str = f"{overall:.0f}/100" if overall is not None else "—"
@@ -1082,34 +1191,56 @@ def format_fundamentals(data: dict) -> str:
 
     lines = [
         f"🧭 *INVESTIČNÍ PROFIL: {t}*",
-        f"_{data['name']} · {sector}_",
+        f"_{head_sub}_",
         "━━━━━━━━━━━━━━━━━━━━━━",
-        f"{prof['verdict']}",
+        "*📸 Snímek firmy:*",
+    ]
+    # Cena + roční rozpětí
+    if data.get("price") is not None:
+        bar = _range_bar(data["price"], data.get("wk_low"), data.get("wk_high"))
+        lines.append(f"  💵 Cena `${data['price']:.0f}`" + (f"\n     {bar}" if bar else ""))
+    if data.get("beta") is not None:
+        lines.append(f"  📈 {_beta_label(data['beta'])}")
+    rec = _rec_label(data.get("rec"))
+    if rec:
+        n = data.get("n_analysts")
+        n_str = f" ({n:.0f} analytiků)" if n else ""
+        up = f", cíl {data['upside']:+.0f}%" if data.get("upside") is not None else ""
+        lines.append(f"  🏆 Analytici: {rec}{n_str}{up}")
+    dy = data.get("div_yield")
+    if dy is not None and dy > 0:
+        po = data.get("payout")
+        po_str = f" (vyplácí {po*100:.0f}% zisku)" if po and 0 < po < 2 else ""
+        lines.append(f"  💸 Dividenda: {dy:.2f}% ročně{po_str}")
+    else:
+        lines.append("  💸 Dividenda: nevyplácí")
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"*🎯 VERDIKT:* {prof['verdict']}",
         f"_{prof['desc']}_",
         "",
         f"📊 *Investiční skóre:* `{overall_str}`",
-        f"   kvalita firmy `{quality_str}`  ·  atraktivita ceny `{value_str}`",
+        f"   kvalita firmy `{quality_str}/100`  ·  atraktivita ceny `{value_str}/100`",
         "━━━━━━━━━━━━━━━━━━━━━━",
-        "*Fundamentální scorecard:*",
+        "*🧪 Fundamentální scorecard:*",
         cat_line("🌱", "Růst", data["growth"]),
         cat_line("💰", "Ziskovost", data["profit"]),
         cat_line("🏦", "Rozvaha", data["balance"]),
         cat_line("🏷️", "Valuace", data["value"]),
         cat_line("💵", "Cash Flow", data["cashflow"]),
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "ℹ️ _Jak číst: známky *A* (výborné) → *F* (slabé). „Kvalita firmy“ = jak dobrý "
+        "je byznys, „atraktivita ceny“ = jak levně ho kupuješ (vyšší = levnější). "
+        "Skvělá firma + nízká cena = sen investora._",
+        "_Fundamenty z Yahoo Finance. Ne investiční doporučení._",
     ]
-    if data.get("upside") is not None:
-        tgt = data.get("target")
-        tgt_str = f" (${tgt:.0f})" if tgt else ""
-        lines += ["━━━━━━━━━━━━━━━━━━━━━━",
-                  f"🎯 *Cíl analytiků:* {data['upside']:+.0f}% upside{tgt_str}"]
-    lines += ["━━━━━━━━━━━━━━━━━━━━━━",
-              "_Fundamentální profil z Yahoo Finance. Ne investiční doporučení._"]
     return "\n".join(lines)
 
 
 def analyze_earnings(ticker: str) -> str:
-    """Kompletní fundamentální profil firmy: scorecard (5 kategorií se známkami)
-    korunovaný investičním verdiktem (kvalita × valuace)."""
+    """Kompletní fundamentální profil firmy: snímek + scorecard (5 kategorií se
+    známkami) korunovaný investičním verdiktem (kvalita × valuace)."""
     data = _gather_fundamentals(ticker)
     if data["price"] is None and data["growth"]["score"] is None and data["value"]["score"] is None:
         return f"❌ Nepodařilo se načíst fundamenty pro *{ticker.upper()}* (špatný ticker, nebo Yahoo nevrací data)."
