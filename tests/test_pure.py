@@ -105,6 +105,70 @@ def test_accum_detects_distribution():
     assert a["is_accum"] is False
 
 
+def test_genius_fuse_empty_is_neutral():
+    # žádné pohledy → neutrál, nulové skóre, nízká jistota
+    r = ag.genius_fuse({"ticker": "X"})
+    assert r["score"] == 0
+    assert "NEUTRÁLNÍ" in r["direction"]
+    assert r["confidence"] == "🔴 Nízká"
+    assert r["factors"] == []
+
+
+def test_genius_fuse_agreement_amplifies():
+    # technika i flow bullish a ve shodě → bullish, slušné skóre
+    lenses = {
+        "ticker": "AAPL", "last": 200.0,
+        "tech": {"setup_type": "🚀 Momentum Breakout", "score": 80,
+                 "entry": "$1-$2", "stop": 1.0, "t1": 3.0, "t2": 4.0, "last": 200.0},
+        "flow": {"score": 0.7, "confidence": "🟢 Vysoká", "accum_count": 2, "premium": 6_000_000},
+        "news": None, "earn_days": None,
+    }
+    r = ag.genius_fuse(lenses)
+    assert "BULLISH" in r["direction"]
+    assert r["agree"] is True
+    assert r["conflict"] is False
+    assert r["score"] >= 70
+    assert any("Technika" in p for p in r["pro"])
+
+
+def test_genius_fuse_conflict_penalizes():
+    # technika bullish, flow bearish → rozpor sráží přesvědčení a hlásí riziko
+    lenses = {
+        "ticker": "TSLA", "last": 250.0,
+        "tech": {"setup_type": "🟢 Pullback Buy", "score": 70, "last": 250.0},
+        "flow": {"score": -0.7, "confidence": "🟡 Střední", "accum_count": 0, "premium": 1_200_000},
+    }
+    r = ag.genius_fuse(lenses)
+    assert r["conflict"] is True
+    assert r["agree"] is False
+    assert any("protiřečí" in x for x in r["risk"])
+
+
+def test_genius_fuse_earnings_risk_flagged():
+    lenses = {
+        "ticker": "NVDA", "last": 120.0,
+        "tech": {"setup_type": "🚀 ATH Breakout", "score": 75, "last": 120.0},
+        "flow": {"score": 0.6, "confidence": "🟢 Vysoká", "accum_count": 1, "premium": 5_000_000},
+        "earn_days": 3,
+    }
+    r = ag.genius_fuse(lenses)
+    assert r["earn_days"] == 3
+    assert any("Earnings" in x for x in r["risk"])
+
+
+def test_genius_fuse_no_setup_is_zero_tech_bias():
+    # „No Setup" → technika přispívá nulou, takže rozhoduje flow
+    lenses = {
+        "ticker": "MSFT", "last": 400.0,
+        "tech": {"setup_type": "⚠️ No Setup", "score": 0, "last": 400.0},
+        "flow": {"score": 0.5, "confidence": "🟡 Střední", "accum_count": 0, "premium": 800_000},
+    }
+    r = ag.genius_fuse(lenses)
+    t = next(f for f in r["factors"] if f["name"] == "Technika")
+    assert t["bias"] == 0.0
+    assert "BULLISH" in r["direction"]   # směr táhne flow
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

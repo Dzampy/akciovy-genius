@@ -112,6 +112,15 @@ _flow_lock = threading.Lock()      # chrání _flow_history (engine běží ve v
 _flow_dirty = False                # je co flushnout na disk?
 _flow_loaded = False               # už jsme načetli z disku?
 
+# ── Genius Score (fúze více pohledů do jediného přesvědčení) ───────────────────
+# Sloučí technický setup, options flow a (volitelně) news sentiment do jednoho
+# 0–100 skóre + směru + jistoty. Váhy se přepočítají jen přes dostupné pohledy.
+GENIUS_W_TECH = float(os.getenv("GENIUS_W_TECH", "0.45"))     # váha technického pohledu
+GENIUS_W_FLOW = float(os.getenv("GENIUS_W_FLOW", "0.40"))     # váha options flow
+GENIUS_W_NEWS = float(os.getenv("GENIUS_W_NEWS", "0.15"))     # váha news sentimentu
+GENIUS_DIR_THRESHOLD = float(os.getenv("GENIUS_DIR_THRESHOLD", "0.15"))  # |bias| pro směr
+GENIUS_EARN_RISK_DAYS = int(os.getenv("GENIUS_EARN_RISK_DAYS", "7"))     # earnings „blízko" = riziko
+
 _WHALE_RADAR_FILE = "whale_radar.json"
 whale_radar_chats: set = set()     # chat_id odběratelů radaru (perzistované)
 _whale_scan_idx = 0                # rotující ukazatel do univerza tickerů
@@ -1552,6 +1561,280 @@ async def flow_history_flush_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==============================================================================
+# 3b. GENIUS SCORE — fúzní engine (technika + flow + news → 1 přesvědčení)
+# ==============================================================================
+# Každý dílčí engine vidí jen svůj kousek trhu. Genius Score je sloučí do jediného
+# 0–100 přesvědčení + směru + jistoty. Klíčová myšlenka: shoda více nezávislých
+# pohledů je víc než součet jejich částí, rozpor je naopak varování.
+
+def genius_fuse(lenses: dict) -> dict:
+    """Čistá (testovatelná) fúze pohledů → finální verdikt.
+
+    lenses = {
+        "ticker": str, "last": float|None,
+        "tech":  {"setup_type","score","entry","stop","t1","t2","rr_zone","last"} | None,
+        "flow":  {"score" ∈[-1,1], "confidence", "accum_count", "premium"} | None,
+        "news":  {"label": "bullish"|"bearish"|"neutral"} | None,
+        "earn_days": int | None,
+    }
+    """
+    factors = []   # každý: {name, bias ∈ [-1,1], weight, desc}
+
+    tech = lenses.get("tech")
+    if tech:
+        st = tech.get("setup_type", "")
+        score01 = max(0.0, min(1.0, tech.get("score", 0) / 100.0))
+        if "No Setup" in st:
+            t_bias = 0.0
+        elif "Reversal" in st or "🔄" in st:
+            t_bias = -score01            # reversal = proti dosavadnímu trendu
+        else:
+            t_bias = score01             # ostatní setupy enginu jsou long-biased
+        factors.append({"name": "Technika", "bias": t_bias, "weight": GENIUS_W_TECH,
+                        "desc": f"{st} ({tech.get('score', 0):.0f}/100)"})
+
+    flow = lenses.get("flow")
+    if flow:
+        f_bias = max(-1.0, min(1.0, flow.get("score", 0.0)))
+        accum_n = int(flow.get("accum_count", 0) or 0)
+        if accum_n > 0:
+            f_bias = max(-1.0, min(1.0, f_bias * 1.2))   # vícedenní akumulace zesiluje signál
+        desc = f"flow {f_bias:+.2f}"
+        if accum_n > 0:
+            desc += f", {accum_n}× akumulace"
+        factors.append({"name": "Options flow", "bias": f_bias, "weight": GENIUS_W_FLOW,
+                        "desc": desc})
+
+    news = lenses.get("news")
+    if news and news.get("label") in ("bullish", "bearish", "neutral"):
+        n_map = {"bullish": 0.6, "bearish": -0.6, "neutral": 0.0}
+        n_bias = n_map[news["label"]]
+        factors.append({"name": "News sentiment", "bias": n_bias, "weight": GENIUS_W_NEWS,
+                        "desc": {"bullish": "🟢 Bullish", "bearish": "🔴 Bearish",
+                                 "neutral": "🟡 Neutral"}[news["label"]]})
+
+    # Vážený průměr jen přes DOSTUPNÉ pohledy (váhy se přenormují).
+    w_total = sum(f["weight"] for f in factors)
+    net_bias = sum(f["bias"] * f["weight"] for f in factors) / w_total if w_total > 0 else 0.0
+
+    if net_bias >= GENIUS_DIR_THRESHOLD:
+        direction = "📈 BULLISH"
+    elif net_bias <= -GENIUS_DIR_THRESHOLD:
+        direction = "📉 BEARISH"
+    else:
+        direction = "➡️ NEUTRÁLNÍ"
+
+    # Přesvědčení = síla biasu, modulovaná shodou/rozporem technika×flow a earnings.
+    t_bias = next((f["bias"] for f in factors if f["name"] == "Technika"), None)
+    f_bias = next((f["bias"] for f in factors if f["name"] == "Options flow"), None)
+    agree = conflict = False
+    if t_bias is not None and f_bias is not None and abs(t_bias) > 0.05 and abs(f_bias) > 0.05:
+        if (t_bias > 0) == (f_bias > 0): agree = True
+        else: conflict = True
+
+    conviction = abs(net_bias) * 100.0
+    if agree:    conviction *= 1.15
+    if conflict: conviction *= 0.65
+
+    earn_days = lenses.get("earn_days")
+    earn_soon = earn_days is not None and 0 <= earn_days <= GENIUS_EARN_RISK_DAYS
+    if earn_soon:
+        conviction *= 0.9        # blízké earnings = binární riziko → sleva na jistotě
+    conviction = max(0.0, min(100.0, conviction))
+
+    n_avail = len(factors)
+    if conviction >= 70 and agree and n_avail >= 2:
+        confidence = "🟢 Vysoká"
+    elif conviction >= 45:
+        confidence = "🟡 Střední"
+    else:
+        confidence = "🔴 Nízká"
+
+    # Pro & riziko v lidské řeči.
+    pro, risk = [], []
+    for f in factors:
+        if f["bias"] >= 0.2:   pro.append(f"{f['name']}: {f['desc']}")
+        elif f["bias"] <= -0.2: risk.append(f"{f['name']}: {f['desc']}")
+    if conflict:
+        risk.append("Technika a flow si protiřečí")
+    if earn_soon:
+        risk.append(f"Earnings za {earn_days} d (binární riziko)")
+
+    return {
+        "ticker": lenses.get("ticker", "?"),
+        "last": lenses.get("last"),
+        "score": round(conviction),
+        "direction": direction,
+        "confidence": confidence,
+        "net_bias": net_bias,
+        "factors": factors,
+        "pro": pro,
+        "risk": risk,
+        "agree": agree,
+        "conflict": conflict,
+        "earn_days": earn_days,
+        "n_lenses": n_avail,
+        "tech": tech,
+    }
+
+
+def _genius_thesis(r: dict) -> str:
+    """Jednovětá teze v lidské řeči podle směru + jistoty."""
+    d = r["direction"]
+    if "BULLISH" in d:
+        core = "Pohledy se kloní na long stranu"
+    elif "BEARISH" in d:
+        core = "Pohledy se kloní na short/opatrnou stranu"
+    else:
+        core = "Pohledy jsou rozdělené, jasný směr chybí"
+    if r["agree"]:
+        core += " a technika se shoduje s flow"
+    elif r["conflict"]:
+        core += ", ale technika a flow si protiřečí"
+    return core + "."
+
+
+def format_genius(r: dict) -> str:
+    bar_n = int(round(r["score"] / 10))
+    bar = "█" * bar_n + "░" * (10 - bar_n)
+    last = f" • spot ${r['last']:.2f}" if r.get("last") else ""
+
+    lines = [
+        f"🧠 *GENIUS SCORE: {r['ticker']}*{last}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"*{r['score']}/100*  `{bar}`",
+        f"{r['direction']}  •  Jistota: {r['confidence']}",
+        "",
+        f"_{_genius_thesis(r)}_",
+        "",
+        "*Pohledy:*",
+    ]
+    if r["factors"]:
+        for f in r["factors"]:
+            arrow = "🟢" if f["bias"] >= 0.2 else ("🔴" if f["bias"] <= -0.2 else "⚪")
+            lines.append(f" {arrow} *{f['name']}:* {f['desc']}")
+    else:
+        lines.append(" _(žádná data)_")
+
+    if r["pro"]:
+        lines += ["", "✅ *Pro:*"] + [f"  • {p}" for p in r["pro"]]
+    if r["risk"]:
+        lines += ["", "⚠️ *Riziko:*"] + [f"  • {x}" for x in r["risk"]]
+
+    # Obchodní úrovně ukazuj jen pro bullish setup (engine je long-biased).
+    tech = r.get("tech")
+    if tech and "BULLISH" in r["direction"] and "No Setup" not in tech.get("setup_type", ""):
+        lines += [
+            "",
+            "🎯 *Úrovně (z techniky):*",
+            f"  Vstup: `{tech.get('entry', 'N/A')}`",
+            f"  Stop: `${tech.get('stop', 0):.2f}`  •  T1: `${tech.get('t1', 0):.2f}`  •  T2: `${tech.get('t2', 0):.2f}`",
+        ]
+
+    lines += ["━━━━━━━━━━━━━━━━━━━━━━", "_Fúze veřejných dat, ne investiční doporučení._"]
+    return "\n".join(lines)
+
+
+async def get_news_sentiment(ticker: str) -> dict | None:
+    """News lens přes Groq. None = nedostupné (chybí klíč / data / chyba)."""
+    if client is None:
+        return None
+    try:
+        items = await asyncio.to_thread(fetch_yahoo_rss, ticker)
+        if not items:
+            return None
+        combined = "\n---\n".join(f"Titulek: {i['title']}\nShrnutí: {i['summary']}" for i in items)
+        prompt = (
+            f"Jsi quant trader. Zhodnoť sentiment těchto zpráv pro {ticker}:\n\n{combined}\n\n"
+            "Odpověz JEDNÍM slovem: BULLISH, BEARISH nebo NEUTRAL. Nic víc."
+        )
+        out = await ask_groq(prompt, temperature=0.0)
+        if not out:
+            return None
+        u = out.strip().upper()
+        if "BULL" in u:   return {"label": "bullish"}
+        if "BEAR" in u:   return {"label": "bearish"}
+        return {"label": "neutral"}
+    except Exception as e:
+        log.debug("[GENIUS] news lens %s chyba: %s", ticker, e)
+        return None
+
+
+def _next_earnings_days(ticker: str):
+    """Počet dní do nejbližších earnings (None = neznámé)."""
+    try:
+        cal = yf.Ticker(ticker).calendar
+        ed = None
+        if isinstance(cal, dict):
+            ed = cal.get("Earnings Date")
+            if isinstance(ed, (list, tuple)):
+                ed = ed[0] if ed else None
+        elif cal is not None and hasattr(cal, "loc"):
+            try: ed = cal.loc["Earnings Date"][0]
+            except Exception: ed = None
+        if ed is None:
+            return None
+        if hasattr(ed, "date"):
+            ed = ed.date()
+        return (ed - datetime.now().date()).days
+    except Exception:
+        return None
+
+
+async def _next_earnings_days_async(ticker: str):
+    return await asyncio.to_thread(_next_earnings_days, ticker)
+
+
+async def gather_genius(ticker: str) -> dict:
+    """Posbírá všechny pohledy paralelně a vrátí finální verdikt z genius_fuse."""
+    ticker = ticker.upper()
+
+    async def get_tech():
+        # flow=False → čistý technický pohled (flow fúzujeme zvlášť, ať se nezapočítá 2×).
+        try:
+            _, _, data = await asyncio.to_thread(make_chart, ticker, "1d", False, False)
+            return data
+        except Exception as e:
+            log.debug("[GENIUS] tech lens %s chyba: %s", ticker, e)
+            return None
+
+    async def get_flow():
+        try:
+            tk = yf.Ticker(ticker)
+            hist = await asyncio.to_thread(tk.history, period="1d")
+            if hist.empty:
+                return None
+            spot = float(hist["Close"].iloc[-1])
+            hits, _ = await asyncio.to_thread(analyze_options_flow, ticker, spot)
+            if not hits:
+                return {"score": 0.0, "confidence": "🔴 Nízká", "accum_count": 0,
+                        "premium": 0.0, "spot": spot}
+            score, _, confidence = compute_flow_score(hits)
+            accum_count = sum(1 for h in hits if (h.get("accum") or {}).get("is_accum"))
+            premium = sum(h["premium"] for h in hits)
+            return {"score": score, "confidence": confidence, "accum_count": accum_count,
+                    "premium": premium, "spot": spot}
+        except Exception as e:
+            log.debug("[GENIUS] flow lens %s chyba: %s", ticker, e)
+            return None
+
+    tech, flow, news, earn_days = await asyncio.gather(
+        get_tech(), get_flow(), get_news_sentiment(ticker), _next_earnings_days_async(ticker)
+    )
+
+    last = None
+    if tech and tech.get("last"):
+        last = tech["last"]
+    elif flow and flow.get("spot"):
+        last = flow["spot"]
+
+    return genius_fuse({
+        "ticker": ticker, "last": last,
+        "tech": tech, "flow": flow, "news": news, "earn_days": earn_days,
+    })
+
+
+# ==============================================================================
 # 4. TELEGRAM HANDLERY
 # ==============================================================================
 
@@ -1578,6 +1861,9 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• `/setup ASTS` – Confluence setup (entry zóna, stop, targety, R:R)\n"
         "• `/smc ASTS` – Smart Money Concepts (Order Blocks, FVG, sweepy)\n"
         "• `/sniper ASTS` – alert na zásah OB zóny (vypnutí: `/sniper off ASTS`)\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "*🧠 Genius Score*\n"
+        "• `/genius AAPL` – fúze techniky + flow + news do 1 přesvědčení (0–100)\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "*🔍 Skenery*\n"
         "• `/nasdaq` – TOP 10 setupů z NASDAQ-100\n"
@@ -2655,6 +2941,31 @@ async def handle_ticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     short_caption = f"🎯 Technický setup pro *{ticker}* ({interval})"
     await reply_photo_with_text(update.message, png, text, short_caption)
 
+async def genius_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """🧠 Genius Score — sloučí techniku, options flow a news do 1 přesvědčení."""
+    if not ctx.args:
+        await update.message.reply_text("Použití: `/genius AAPL`", parse_mode="Markdown")
+        return
+
+    ticker = ctx.args[0].upper()
+    msg = await update.message.reply_text(
+        f"🧠 Skládám *Genius Score* pro *{ticker}* (technika + flow + news)...",
+        parse_mode="Markdown",
+    )
+
+    try:
+        r = await asyncio.wait_for(gather_genius(ticker), timeout=45.0)
+        text = format_genius(r)
+        await asyncio.to_thread(save_flow_history)   # flow lens zapsal dnešní snapshot
+    except asyncio.TimeoutError:
+        text = f"❌ Analýza *{ticker}* trvala moc dlouho."
+    except Exception as e:
+        text = f"❌ Chyba: {e}"
+
+    try: await msg.edit_text(text, parse_mode="Markdown")
+    except Exception: await msg.edit_text(text.replace("*", "").replace("`", "").replace("_", ""))
+
+
 async def setup_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("Použití: `/setup ASTS`", parse_mode="Markdown")
@@ -2793,6 +3104,7 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("news", news))
     app.add_handler(CommandHandler("unusual", unusual))
+    app.add_handler(CommandHandler(["genius", "g"], genius_cmd))
     app.add_handler(CommandHandler("earnings", earnings_cmd))
     app.add_handler(CallbackQueryHandler(ai_news_callback, pattern="^ainews_"))
     app.add_handler(CommandHandler("setup", setup_cmd))
