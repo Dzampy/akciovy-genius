@@ -1517,11 +1517,15 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
                         df_btc = pd.DataFrame(k_data).iloc[:, 1:6]
                         df_btc.columns = ["Open", "High", "Low", "Close", "Volume"]
                         df_btc = df_btc.astype(float)
-                        aktualni_cena = float(df_btc["Close"].iloc[-1])
-                        aktualni_vol = float(df_btc["Volume"].iloc[-1])
-                        prumer_vol_10m = float(df_btc["Volume"].iloc[-11:-1].mean())
-                        atr = compute_atr(df_btc)
-                        ma_data = True
+                        # Poslední kline z Binance je právě se tvořící svíčka → pro objem
+                        # ber poslední UZAVŘENOU (předposlední), cenu z té nejnovější.
+                        closed_btc = df_btc.iloc[:-1]
+                        if len(closed_btc) >= 11:
+                            aktualni_cena = float(df_btc["Close"].iloc[-1])
+                            aktualni_vol = float(closed_btc["Volume"].iloc[-1])
+                            prumer_vol_10m = float(closed_btc["Volume"].iloc[-11:-1].mean())
+                            atr = compute_atr(closed_btc)
+                            ma_data = True
             except Exception as e:
                 log.error("Chyba Binance API: %s", e)
 
@@ -1537,11 +1541,18 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
                 data_1m.columns = [str(c).strip() for c in data_1m.columns]
 
                 if 'Close' in data_1m.columns and 'Volume' in data_1m.columns:
-                    aktualni_cena = float(data_1m['Close'].iloc[-1])
-                    aktualni_vol = float(data_1m['Volume'].iloc[-1])
-                    prumer_vol_10m = float(data_1m['Volume'].tail(11).head(10).mean())
-                    atr = compute_atr(data_1m)
-                    ma_data = True
+                    # Nejnovější cena (i z právě se tvořící svíčky).
+                    last_price = float(data_1m['Close'].dropna().iloc[-1]) if data_1m['Close'].notna().any() else 0.0
+                    # Objem počítej JEN z uzavřených svíček s reálným objemem —
+                    # poslední 1m bar z yfinance bývá rozpracovaný/nulový (proto „0x normál").
+                    closed = data_1m.dropna(subset=['Close'])
+                    closed = closed[closed['Volume'].fillna(0) > 0]
+                    if last_price > 0 and len(closed) >= 11:
+                        aktualni_cena = last_price
+                        aktualni_vol = float(closed['Volume'].iloc[-1])
+                        prumer_vol_10m = float(closed['Volume'].iloc[-11:-1].mean())
+                        atr = compute_atr(closed)
+                        ma_data = True
 
         # Směr + stop z ATR (s fallbackem na pevné % když ATR chybí).
         smer = ""
