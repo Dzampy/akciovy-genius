@@ -1,0 +1,24 @@
+# Tajné údaje
+.env
+*.env
+token.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logy a runtime stav
+bot.log
+active_snipers.json
+
+# Cache / databáze
+*.sqlite
+*.db
+
+# macOS
+.DS_Store
+
+# Stažené dočasné soubory
+*.pdf

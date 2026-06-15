@@ -2,6 +2,8 @@ import io
 import math
 import asyncio
 import time
+import json
+import logging
 from datetime import datetime, timezone
 import os
 import re
@@ -26,19 +28,111 @@ from mtf_analysis import analyze_mtf_levels, format_level, format_zone, make_mtf
 from dotenv import load_dotenv
 load_dotenv()
 
-print("\n" + "="*50)
-print("🚀 [TEST] WEBHOOK FUNGUJE! Nová verze je nasazena!")
-print("="*50 + "\n")
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log", encoding="utf-8")],
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("akciovygenius")
 
-# Tvoje natvrdo zadané klíče
-TOKEN = "8825645830:AAGat5gPqE16QUe2W_UQ4SrlzpyBEa10daU" 
-AV_KEY ="Q3UCP540D9VVDBBI"
+log.info("🚀 Startuji Akciový Genius bota…")
+
+# ── Klíče / tajné údaje ───────────────────────────────────────────────────────
+# Načítají se z prostředí (.env). NIKDY je necommituj do gitu — viz .gitignore.
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+AV_KEY = os.getenv("AV_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # Inicializace klienta pro Groq — jen pokud je klíč k dispozici.
 # Bez této pojistky by Groq(api_key=None) vyhodil výjimku už při startu a shodil celý bot.
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+if client is None:
+    log.warning("GROQ_API_KEY chybí — AI funkce (news, walter, /ai) budou vypnuté.")
 
 active_snipers = {}
+
+
+# ── Helper: volání Groq s pojistkou proti chybějícímu klíči ───────────────────
+async def ask_groq(prompt: str, temperature: float = 0.2,
+                   model: str = "llama-3.3-70b-versatile"):
+    """Zavolá Groq chat completion a vrátí text odpovědi.
+    Když klient není nakonfigurovaný (chybí GROQ_API_KEY), vrátí None."""
+    if client is None:
+        log.warning("Pokus o volání Groq bez klíče — přeskakuji.")
+        return None
+    resp = await asyncio.to_thread(
+        client.chat.completions.create,
+        messages=[{"role": "user", "content": prompt}],
+        model=model,
+        temperature=temperature,
+    )
+    return resp.choices[0].message.content
+
+
+# ── Jednoduchá TTL cache pro yfinance stahování ───────────────────────────────
+_YF_CACHE: dict = {}
+
+def cached_yf_download(ticker: str, period: str, interval: str, ttl: int = 300):
+    """yf.download s in-memory TTL cache (výchozí 5 min).
+    Snižuje počet requestů na Yahoo a riziko rate-limitu při hromadných skenech."""
+    key = (ticker.upper(), period, interval)
+    now = time.time()
+    cached = _YF_CACHE.get(key)
+    if cached and now - cached[0] < ttl:
+        return cached[1].copy()
+    df = yf.download(ticker, period=period, interval=interval,
+                     auto_adjust=True, progress=False, group_by="ticker")
+    _YF_CACHE[key] = (now, df.copy())
+    return df
+
+
+# ── Persistence aktivních sniperů (přežije restart bota) ──────────────────────
+SNIPERS_FILE = "active_snipers.json"
+
+def load_snipers() -> dict:
+    """Načte uložené snipery z disku. Klíče = chat_id (int), hodnoty = set tickerů."""
+    try:
+        with open(SNIPERS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return {int(k): set(v) for k, v in raw.items()}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log.error("Chyba při načítání sniperů: %s", e)
+        return {}
+
+def save_snipers() -> None:
+    """Uloží aktuální stav active_snipers na disk."""
+    try:
+        with open(SNIPERS_FILE, "w", encoding="utf-8") as f:
+            json.dump({str(k): sorted(v) for k, v in active_snipers.items()}, f)
+    except Exception as e:
+        log.error("Nepodařilo se uložit snipery: %s", e)
+
+
+# ── Telegram helpery (limity délky zpráv) ─────────────────────────────────────
+TG_CAPTION_LIMIT = 1024   # max délka popisku fotky
+TG_MSG_LIMIT = 4096       # max délka textové zprávy
+
+async def reply_long(message, text: str, parse_mode: str = "Markdown") -> None:
+    """Pošle text rozdělený na kusy do 4096 znaků. Když selže Markdown, zkusí plain text."""
+    for i in range(0, len(text), TG_MSG_LIMIT):
+        chunk = text[i:i + TG_MSG_LIMIT]
+        try:
+            await message.reply_text(chunk, parse_mode=parse_mode)
+        except Exception:
+            await message.reply_text(chunk.replace("*", "").replace("`", "").replace("_", ""))
+
+async def reply_photo_with_text(message, png: bytes, text: str, short_caption: str) -> None:
+    """Pošle fotku s krátkým popiskem a plnou analýzu jako samostatné zprávy.
+    Řeší tím limit 1024 znaků na popisek fotky."""
+    try:
+        await message.reply_photo(photo=io.BytesIO(png), caption=short_caption, parse_mode="Markdown")
+    except Exception:
+        await message.reply_photo(photo=io.BytesIO(png),
+                                  caption=short_caption.replace("*", "").replace("`", ""))
+    await reply_long(message, text)
 # ── Timeframe konfigurace ────────────────────────────────────────────────────
 TF_PERIOD = {
     "1m": "5d", "5m": "1mo", "15m": "1mo", "30m": "2mo",
@@ -143,15 +237,15 @@ def fetch_yahoo_rss(ticker: str) -> list:
 # ==============================================================================
 def make_chart(ticker: str, interval: str = "1d", render: bool = True):
     if interval in ["1h", "4h"]:
-        return make_sr_chart(ticker, interval)
+        png, text = make_sr_chart(ticker, interval)
+        return png, text, None
 
     period = "1y" if interval in ["1d", "4h", "1wk"] else TF_PERIOD.get(interval, "1y")
     yf_interval = "1h" if interval == "4h" else interval
-    
-    df = yf.download(ticker, period=period, interval=yf_interval,
-                     auto_adjust=True, progress=False, group_by="ticker")
-                     
-    if df.empty: return None, f"❌ Žádná data pro '{ticker}'."
+
+    df = cached_yf_download(ticker, period, yf_interval)
+
+    if df.empty: return None, f"❌ Žádná data pro '{ticker}'.", None
     if isinstance(df.columns, pd.MultiIndex):
         if ticker.upper() in df.columns.levels[0]: df = df[ticker.upper()]
         else: df.columns = df.columns.get_level_values(-1)
@@ -159,7 +253,7 @@ def make_chart(ticker: str, interval: str = "1d", render: bool = True):
     if interval == "4h":
         df = df.resample("4h").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
 
-    if df.empty or len(df) < 60: return None, f"❌ Nedostatek dat."
+    if df.empty or len(df) < 60: return None, f"❌ Nedostatek dat.", None
 
     last = float(df["Close"].iloc[-1])
     
@@ -415,7 +509,26 @@ def make_chart(ticker: str, interval: str = "1d", render: bool = True):
         f"⚖️ *R:R (V zóně):* `1 : {rr_zone:.1f}`"
     ]
 
-    return png, "\n".join(lines)
+    # Strukturovaná data pro skenery (aby nemusely parsovat text regexem).
+    data = {
+        "ticker": ticker.upper(),
+        "setup_type": setup_type,
+        "score": best_total_score,
+        "sm": sm_score,
+        "entry_bot": best_zone_bot,
+        "entry_top": best_zone_top,
+        "entry": f"${best_zone_bot:.2f}-${best_zone_top:.2f}",
+        "stop": stop_loss,
+        "t1": target1,
+        "t2": target2,
+        "rr_zone": rr_zone,
+        "rr_now": rr_now,
+        "mom_ok": sm_mom == 1,
+        "vol_ok": sm_vol == 1,
+        "last": last,
+    }
+
+    return png, "\n".join(lines), data
 
 def make_sr_chart(ticker: str, interval: str):
     try:
@@ -447,7 +560,7 @@ def make_sr_chart(ticker: str, interval: str):
     return None, "\n".join(lines)
 
 def analyze_setup(ticker: str):
-    _, text = make_chart(ticker, "1d")
+    _, text, _ = make_chart(ticker, "1d")
     return text
 
 # ==============================================================================
@@ -928,7 +1041,31 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🛠 *Další příkazy:*\n"
         "📰 `/news ONDS` – Nejnovější zprávy\n"
         "🌊 `/unusual AAPL` – Detekce velkých opčních obchodů (Whale activity)\n"
-        "📑 `/earnings ASTS` – Hodnocení posledních kvartálních výsledků",
+        "📑 `/earnings ASTS` – Hodnocení posledních kvartálních výsledků\n\n"
+        "ℹ️ Kompletní seznam příkazů: `/help`",
+        parse_mode="Markdown")
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *PŘEHLED PŘÍKAZŮ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "*📊 Grafy & setupy*\n"
+        "• `AAPL` nebo `RKLB 4h` – graf + S/R úrovně (TF: 1m,5m,15m,30m,1h,4h,1d,1wk,1mo)\n"
+        "• `/setup ASTS` – Confluence setup (entry zóna, stop, targety, R:R)\n"
+        "• `/smc ASTS` – Smart Money Concepts (Order Blocks, FVG, sweepy)\n"
+        "• `/sniper ASTS` – alert na zásah OB zóny (vypnutí: `/sniper off ASTS`)\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "*🔍 Skenery*\n"
+        "• `/nasdaq` – TOP 10 setupů z NASDAQ-100\n"
+        "• `/darkhorse` – skryté příležitosti z Russell 2000\n"
+        "• `/whales` – ranní whale-flow skener\n"
+        "• `/unusual AAPL` – neobvyklá opční aktivita\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "*🤖 AI & fundament*\n"
+        "• `/news ONDS` – AI sentiment z nejnovějších zpráv\n"
+        "• `/earnings ASTS` – hodnocení posledních výsledků\n"
+        "• `/ai` (s PDF) – tvrdý výtah z prezentace/reportu\n"
+        "• `/walter`, `/testwalter` – makro market alerty",
         parse_mode="Markdown")
 
 last_market_text = ""
@@ -1106,14 +1243,17 @@ async def sniper_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ticker = ctx.args[1].upper()
             if ticker in active_snipers[chat_id]:
                 active_snipers[chat_id].remove(ticker)
+                save_snipers()
                 await update.message.reply_text(f"🔕 Sniper pro *{ticker}* byl deaktivován.", parse_mode="Markdown")
         else:
             active_snipers[chat_id].clear()
+            save_snipers()
             await update.message.reply_text(f"🔕 Všichni SMC Snipeři byli deaktivováni.", parse_mode="Markdown")
         return
 
     ticker = prikaz
     active_snipers[chat_id].add(ticker)
+    save_snipers()
     await update.message.reply_text(
         f"🎯 *SMC SNIPER AKTIVOVÁN: {ticker}*\n"
         f"Bot nyní každou minutu skenuje graf na pozadí. Jakmile cena zasáhne nezasažený (unmitigated) Order Block, pošlu ti okamžitý alert.", 
@@ -1124,7 +1264,10 @@ async def sniper_background_task(context: ContextTypes.DEFAULT_TYPE):
     for chat_id, tickers in list(active_snipers.items()):
         for ticker in list(tickers):
             try:
-                df = await asyncio.to_thread(yf.download, ticker, period="3d", interval="15m", progress=False)
+                df = await asyncio.wait_for(
+                    asyncio.to_thread(yf.download, ticker, period="3d", interval="15m", progress=False),
+                    timeout=20.0,
+                )
                 if df.empty: continue
                 if isinstance(df.columns, pd.MultiIndex):
                     df = df[ticker] if ticker in df.columns.levels[0] else df.copy()
@@ -1146,7 +1289,11 @@ async def sniper_background_task(context: ContextTypes.DEFAULT_TYPE):
                 if alert_msg:
                     await context.bot.send_message(chat_id=chat_id, text=f"🎯 *SMC SNIPER HIT*\n━━━━━━━━━━━━━━━━━━━━━━\n{alert_msg}", parse_mode="Markdown")
                     active_snipers[chat_id].remove(ticker)
-            except Exception as e: print(f"Sniper chyba: {e}")
+                    save_snipers()
+            except asyncio.TimeoutError:
+                log.warning("Sniper: timeout při stahování %s", ticker)
+            except Exception as e:
+                log.error("Sniper chyba u %s: %s", ticker, e)
 
 
 # Tuhle proměnnou musíme definovat ZVENKU před funkcí, aby se na ni mohl globálně odkazovat
@@ -1184,7 +1331,7 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
             return
             
         # 4. JE TO NOVÉ! Uložíme do paměti a jdeme pracovat
-        print(f"🚨 [WALTER] ZAZNAMENÁNA NOVÁ ZPRÁVA: {text_tweetu[:50]}...")
+        log.info("[WALTER] Nová zpráva: %s...", text_tweetu[:50])
         with open(pamet_soubor, "w", encoding="utf-8") as f:
             f.write(text_tweetu)
             
@@ -1210,13 +1357,10 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
         }}
         """
         
-        chat_completion = await asyncio.to_thread(
-            client.chat.completions.create,
-            messages=[{"role": "user", "content": prompt_detekce}],
-            model="llama-3.3-70b-versatile",
-            temperature=0
-        )
-        ai_text = chat_completion.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+        ai_raw = await ask_groq(prompt_detekce, temperature=0)
+        if ai_raw is None:
+            return
+        ai_text = ai_raw.replace("```json", "").replace("```", "").strip()
         
         import json
         try:
@@ -1226,7 +1370,7 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
             
         # Zastavení nesmyslných zpráv hned na začátku
         if analyza.get("typ") == "ignore":
-            print(f"Walter zahodil irelevantní zprávu: {text_tweetu}")
+            log.info("Walter zahodil irelevantní zprávu: %s", text_tweetu)
             return
             
         # --- FÁZE 2: UNIVERZÁLNÍ VOLUME SPIKE ---
@@ -1279,7 +1423,7 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
                             smer = "SHORT 🔴"
                         ma_data = True
             except Exception as e:
-                print(f"Chyba Binance API: {e}")
+                log.error("Chyba Binance API: %s", e)
                 
         else:
             data_1m = await asyncio.to_thread(yf.download, target_ticker, period="1d", interval="1m", progress=False)
@@ -1341,13 +1485,9 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
         🤖 *AI Analýza:* [1 úderná věta makro-kontextu]
         """
         
-        response_makro = await asyncio.to_thread(
-            client.chat.completions.create,
-            messages=[{"role": "user", "content": prompt_makro}],
-            model="llama-3.3-70b-versatile",
-            temperature=0.2
-        )
-        makro_text = response_makro.choices[0].message.content
+        makro_text = await ask_groq(prompt_makro, temperature=0.2)
+        if makro_text is None:
+            return
         
         vol_info = ""
         if ma_data and prumer_vol_10m > 0:
@@ -1362,7 +1502,7 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=context.job.chat_id, text=zprava_makro, parse_mode="Markdown")
         
     except Exception as e:
-        print(f"Chyba v makro smyčce: {e}") 
+        log.error("Chyba v makro smyčce: %s", e) 
         pass
 
 async def cmd_walter(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1435,14 +1575,12 @@ async def cmd_testwalter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         🤖 *AI Analýza:* [1 úderná věta makro-kontextu]
         """
         
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
-            temperature=0.2
-        )
-        
-        zprava = f"🛠️ *TEST MARKET ALERT*\n━━━━━━━━━━━━━━━━━━━━━━\n{response.choices[0].message.content}"
+        ai_out = await ask_groq(prompt, temperature=0.2)
+        if ai_out is None:
+            await update.message.reply_text("⚠️ AI není nakonfigurovaná (chybí GROQ_API_KEY).")
+            return
+
+        zprava = f"🛠️ *TEST MARKET ALERT*\n━━━━━━━━━━━━━━━━━━━━━━\n{ai_out}"
         await update.message.reply_text(zprava, parse_mode="Markdown")
         
     except Exception as e:
@@ -1506,14 +1644,12 @@ async def ai_news_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "3. Nepoužívej vůbec žádné Markdown hvězdičky."
         )
         
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
-            temperature=0.2
-        )
-        
-        final_text = f"📰 *AI SENTIMENT: {ticker}*\n━━━━━━━━━━━━━━━━━━━━━━\n{response.choices[0].message.content}"
+        ai_out = await ask_groq(prompt, temperature=0.2)
+        if ai_out is None:
+            await query.edit_message_text("⚠️ AI není nakonfigurovaná (chybí GROQ_API_KEY).")
+            return
+
+        final_text = f"📰 *AI SENTIMENT: {ticker}*\n━━━━━━━━━━━━━━━━━━━━━━\n{ai_out}"
         await query.edit_message_text(final_text, parse_mode="Markdown")
         
     except Exception as e:
@@ -1534,43 +1670,21 @@ async def nasdaq_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try:
                 result = await asyncio.to_thread(make_chart, ticker, "1d", False)
                 if not result: return None
-                _, text_output = result
-                if not text_output or text_output.startswith("❌"): return None
-                
-                setup_match = re.search(r"SETUP TYPE:\* `(.*?)`", text_output)
-                score_match = re.search(r"ENTRY CONFIDENCE:.*?\((\d+)/100\)", text_output)
-                
-                if not setup_match or not score_match: return None
-                setup_type = setup_match.group(1)
-                if "No Setup" in setup_type: return None
-                
-                score = int(score_match.group(1))
-                if score <= 0: return None
+                _, _, data = result
+                if not data: return None
 
-                sm_match = re.search(r"SMART MONEY ALIGNMENT:\* `(\d+) / 8`", text_output)
-                sm_score = int(sm_match.group(1)) if sm_match else 0
-                
-                zone_match = re.search(r"Buy Zone:\* `\$([0-9.]+) - \$([0-9.]+)`", text_output)
-                entry = f"${zone_match.group(1)}-${zone_match.group(2)}" if zone_match else "N/A"
-                
-                stop_match = re.search(r"Stop:\* `\$([0-9.]+)`", text_output)
-                stop = f"${stop_match.group(1)}" if stop_match else "N/A"
-                
-                t1_match = re.search(r"Target 1:\* `\$([0-9.]+)`", text_output)
-                target1 = f"${t1_match.group(1)}" if t1_match else "N/A"
-                
-                rr_match = re.search(r"R:R \(V zóně\):\* `1 : ([0-9.]+)`", text_output)
-                rr_zone = f"1:{rr_match.group(1)}" if rr_match else "N/A"
+                if "No Setup" in data["setup_type"]: return None
+                if data["score"] <= 0: return None
 
                 return {
                     "ticker": ticker,
-                    "type": setup_type.replace("🟢 ", "").replace("🚀 ", ""),
-                    "score": score,
-                    "sm": sm_score,
-                    "entry": entry,
-                    "stop": stop,
-                    "t1": target1,
-                    "rr": rr_zone
+                    "type": data["setup_type"].replace("🟢 ", "").replace("🚀 ", ""),
+                    "score": data["score"],
+                    "sm": data["sm"],
+                    "entry": data["entry"],
+                    "stop": f"${data['stop']:.2f}",
+                    "t1": f"${data['t1']:.2f}",
+                    "rr": f"1:{data['rr_zone']:.1f}",
                 }
             except Exception:
                 return None
@@ -1621,30 +1735,22 @@ async def darkhorse_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 result = await asyncio.to_thread(make_chart, ticker, "1d", False)
                 if not result: return None
 
-                _, text = result
-                if not text or text.startswith("❌"): return None
-                
-                setup_match = re.search(r"SETUP TYPE:\* `(.*?)`", text)
-                if not setup_match or "No Setup" in setup_match.group(1): return None 
-                
-                score_match = re.search(r"ENTRY CONFIDENCE:.*?\((\d+)/100\)", text)
-                if not score_match: return None
-                score = int(score_match.group(1))
-                if score < 70: return None 
+                _, _, data = result
+                if not data: return None
+                if "No Setup" in data["setup_type"]: return None
 
-                rr_match = re.search(r"R:R \(V zóně\):\* `1 : ([0-9.]+)`", text)
-                if not rr_match: return None
-                rr_zone = float(rr_match.group(1))
-                if rr_zone < 2.0: return None 
+                score = data["score"]
+                if score < 70: return None
 
-                sm_match = re.search(r"SMART MONEY ALIGNMENT:\* `(\d+) / 8`", text)
-                sm_score = int(sm_match.group(1)) if sm_match else 0
+                rr_zone = data["rr_zone"]
+                if rr_zone < 2.0: return None
 
-                mom_norm = 1.0 if "Mom: ✅" in text else 0.0
-                vol_norm = 1.0 if "Vol: ✅" in text else 0.0
-                
+                sm_score = data["sm"]
+                mom_norm = 1.0 if data["mom_ok"] else 0.0
+                vol_norm = 1.0 if data["vol_ok"] else 0.0
+
                 score_norm = score / 100.0
-                rr_norm = min(rr_zone, 10.0) / 10.0 
+                rr_norm = min(rr_zone, 10.0) / 10.0
                 dh_score = (score_norm * 0.4 + rr_norm * 0.3 + mom_norm * 0.2 + vol_norm * 0.1) * 100
 
                 return {"ticker": ticker, "score": score, "sm": sm_score, "rr": rr_zone, "dh_score": dh_score}
@@ -1795,29 +1901,22 @@ async def handle_ticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(f"⏳ Generuji graf a počítám S/R úrovně pro *{ticker}*...", parse_mode="Markdown")
     
     try:
-        png, text = await asyncio.wait_for(asyncio.to_thread(make_chart, ticker, interval), timeout=30.0)
+        png, text, _ = await asyncio.wait_for(asyncio.to_thread(make_chart, ticker, interval), timeout=30.0)
     except asyncio.TimeoutError:
         await msg.edit_text(f"❌ Generování trvalo moc dlouho a bylo ukončeno.")
         return
     except Exception as e:
         await msg.edit_text(f"❌ Chyba: {e}")
         return
-        
+
     if png is None:
         await msg.edit_text(text)
         return
-        
+
     await msg.delete()
-    
-    try:
-        await update.message.reply_photo(photo=io.BytesIO(png), caption=text, parse_mode="Markdown")
-    except Exception:
-        try:
-            await update.message.reply_photo(photo=io.BytesIO(png), caption=text)
-        except Exception:
-            await update.message.reply_photo(photo=io.BytesIO(png), caption=f"🎯 Technický setup pro {ticker} ({interval})")
-            try: await update.message.reply_text(text, parse_mode="Markdown")
-            except Exception: await update.message.reply_text(text.replace("*", "").replace("`", "").replace("_", ""))
+
+    short_caption = f"🎯 Technický setup pro *{ticker}* ({interval})"
+    await reply_photo_with_text(update.message, png, text, short_caption)
 
 async def setup_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
@@ -1891,16 +1990,14 @@ async def ai_pdf_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         
         # Groq API volání
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
-            temperature=0.2
-        )
-        
+        text_odpovedi = await ask_groq(prompt, temperature=0.2)
+
         os.remove(local_path)
 
-        text_odpovedi = response.choices[0].message.content
+        if text_odpovedi is None:
+            await msg.edit_text("⚠️ AI není nakonfigurovaná (chybí GROQ_API_KEY).")
+            return
+
         limit = 4000
         
         if len(text_odpovedi) <= limit:
@@ -1919,11 +2016,18 @@ async def ai_pdf_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 def main():
     if not TOKEN:
-        print("❌ CHYBA: Chybí TELEGRAM_TOKEN!")
+        log.error("CHYBA: Chybí TELEGRAM_TOKEN! Nastav ho v .env souboru.")
         return
+
+    # Obnov aktivní snipery z minulého běhu
+    global active_snipers
+    active_snipers = load_snipers()
+    if active_snipers:
+        log.info("Obnoveno %d chatů s aktivními snipery.", len(active_snipers))
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("news", news))
     app.add_handler(CommandHandler("unusual", unusual))
     app.add_handler(CommandHandler("earnings", earnings_cmd))
@@ -1938,16 +2042,16 @@ def main():
     app.add_handler(CommandHandler("whales", whales_cmd))
     app.add_handler(CommandHandler("ai", ai_pdf_cmd))
     app.add_handler(MessageHandler(filters.Document.PDF & filters.CaptionRegex(r'^/ai'), ai_pdf_cmd))
-    
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ticker))
 
     # Naplánuj SMC Sniper skener na pozadí (každou minutu), pokud je JobQueue dostupná
     if app.job_queue:
         app.job_queue.run_repeating(sniper_background_task, interval=60, first=15, name="sniper_job")
     else:
-        print("⚠️  JobQueue není dostupná – SMC Sniper na pozadí poběží jen po /sniper. Nainstaluj python-telegram-bot[job-queue].")
+        log.warning("JobQueue není dostupná – SMC Sniper poběží jen po /sniper. Nainstaluj python-telegram-bot[job-queue].")
 
-    print("✅ Bot běží. Zastav pomocí Ctrl+C.")
+    log.info("✅ Bot běží. Zastav pomocí Ctrl+C.")
     app.run_polling()
     
 if __name__ == "__main__":
