@@ -221,6 +221,76 @@ def test_aggregate_edge_empty():
     assert ag._aggregate_edge([]) is None
 
 
+# ── Fundamentální scorecard + investiční profil ──────────────────────────────
+
+def test_letter_grade_bands():
+    assert ag._letter_grade(95) == "A+"
+    assert ag._letter_grade(80) == "A"
+    assert ag._letter_grade(66) == "B"
+    assert ag._letter_grade(50) == "C"
+    assert ag._letter_grade(36) == "D"
+    assert ag._letter_grade(10) == "F"
+    assert ag._letter_grade(None) == "—"
+
+
+def test_band_helpers():
+    # vyšší = lepší
+    assert ag._band_high(40, [(30, 100), (10, 60)], 0) == 100
+    assert ag._band_high(15, [(30, 100), (10, 60)], 0) == 60
+    assert ag._band_high(5, [(30, 100), (10, 60)], 0) == 0
+    # nižší = lepší
+    assert ag._band_low(8, [(10, 100), (20, 60)], 0) == 100
+    assert ag._band_low(15, [(10, 100), (20, 60)], 0) == 60
+    assert ag._band_low(25, [(10, 100), (20, 60)], 0) == 0
+
+
+def test_score_growth_strong_vs_weak():
+    strong = ag.score_growth(40, 35)   # explozivní růst tržeb i EPS
+    assert strong["score"] == 100 and strong["grade"] == "A+"
+    weak = ag.score_growth(-12, -15)   # propad
+    assert weak["score"] < 35 and weak["grade"] == "F"
+    # chybějící data → None skóre, ale nespadne
+    assert ag.score_growth(None, None)["score"] is None
+
+
+def test_score_valuation_cheap_is_higher():
+    cheap = ag.score_valuation(10, 1.5, 0.9)
+    expensive = ag.score_valuation(60, 25, 6.0)
+    assert cheap["score"] > expensive["score"]   # levnější = atraktivnější = vyšší skóre
+
+
+def test_score_balance_net_cash_beats_leverage():
+    healthy = ag.score_balance(0.2, 2.5, cash=50, debt=5)
+    levered = ag.score_balance(2.8, 0.8, cash=5, debt=60)
+    assert healthy["score"] > levered["score"]
+
+
+def test_invest_profile_great_company_fair_price():
+    r = ag.invest_profile(growth=85, profit=90, balance=88, value=70,
+                          cashflow=85, trend=80, upside=20)
+    assert "Skvělá firma" in r["verdict"]
+    assert r["quality"] >= 68 and r["value"] >= 55
+    assert r["overall"] >= 70
+
+
+def test_invest_profile_quality_but_expensive():
+    r = ag.invest_profile(growth=90, profit=95, balance=80, value=35,
+                          cashflow=90, trend=70, upside=5)
+    assert "draho" in r["verdict"]
+
+
+def test_invest_profile_value_trap():
+    r = ag.invest_profile(growth=30, profit=40, balance=45, value=75,
+                          cashflow=35, trend=30, upside=10)
+    assert "rozbitá" in r["verdict"]   # laciná, ale slabé fundamenty
+
+
+def test_invest_profile_empty_is_safe():
+    r = ag.invest_profile(None, None, None, None, None, None, None)
+    assert r["overall"] is None
+    assert "Nedostatek dat" in r["verdict"]
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
