@@ -193,17 +193,34 @@ async def ask_groq(prompt: str, temperature: float = 0.2,
 
 # ── Jednoduchá TTL cache pro yfinance stahování ───────────────────────────────
 _YF_CACHE: dict = {}
+_YF_CACHE_MAX = 256   # strop záznamů, ať cache neroste donekonečna (memory-leak)
 
 def cached_yf_download(ticker: str, period: str, interval: str, ttl: int = 300):
     """yf.download s in-memory TTL cache (výchozí 5 min).
-    Snižuje počet requestů na Yahoo a riziko rate-limitu při hromadných skenech."""
+    Snižuje počet requestů na Yahoo a riziko rate-limitu při hromadných skenech.
+
+    Důležité: prázdné/selhané výsledky se NEcachují — jinak by jeden rate-limit
+    od Yahoo „zamkl" ticker na celý TTL a další pokusy by marně vracely prázdno.
+    """
     key = (ticker.upper(), period, interval)
     now = time.time()
     cached = _YF_CACHE.get(key)
     if cached and now - cached[0] < ttl:
         return cached[1].copy()
+
     df = yf.download(ticker, period=period, interval=interval,
                      auto_adjust=True, progress=False, group_by="ticker")
+
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()  # neukládej prázdno
+
+    # Eviction: vyhoď expirované; když je pořád plno, zahoď nejstarší záznam.
+    if len(_YF_CACHE) >= _YF_CACHE_MAX:
+        for k in [k for k, (t, _) in _YF_CACHE.items() if now - t >= ttl]:
+            del _YF_CACHE[k]
+        if len(_YF_CACHE) >= _YF_CACHE_MAX:
+            del _YF_CACHE[min(_YF_CACHE, key=lambda k: _YF_CACHE[k][0])]
+
     _YF_CACHE[key] = (now, df.copy())
     return df
 
@@ -235,6 +252,20 @@ def save_snipers() -> None:
 # ── Telegram helpery (limity délky zpráv) ─────────────────────────────────────
 TG_CAPTION_LIMIT = 1024   # max délka popisku fotky
 TG_MSG_LIMIT = 4096       # max délka textové zprávy
+
+async def safe_send(bot, chat_id: str, text: str) -> None:
+    """Pošle zprávu s Markdownem; když parser spadne (nepárová */_/`), zopakuje
+    jako čistý text, ať se alert NIKDY neztratí kvůli formátování."""
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+    except Exception:
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text.replace("*", "").replace("`", "").replace("_", ""),
+            )
+        except Exception as e:
+            log.error("safe_send selhal i jako plain text (chat %s): %s", chat_id, e)
 
 async def reply_long(message, text: str, parse_mode: str = "Markdown") -> None:
     """Pošle text rozdělený na kusy do 4096 znaků. Když selže Markdown, zkusí plain text."""
@@ -369,7 +400,7 @@ def fetch_yahoo_rss(ticker: str) -> list:
 # ==============================================================================
 # 2. HLAVNÍ ENGINE (make_chart)
 # ==============================================================================
-def make_chart(ticker: str, interval: str = "1d", render: bool = True):
+def make_chart(ticker: str, interval: str = "1d", render: bool = True, flow: bool = True):
     if interval in ["1h", "4h"]:
         png, text = make_sr_chart(ticker, interval)
         return png, text, None
@@ -437,11 +468,16 @@ def make_chart(ticker: str, interval: str = "1d", render: bool = True):
     fib_618 = high_52 - 0.382 * (high_52 - low_52)
     is_near_ath = last >= high_52 * 0.98
 
-    try:
-        hits, _ = analyze_options_flow(ticker, last)
-        flow_score_val, _, _ = compute_flow_score(hits) if hits else (0.0, {}, "")
-    except Exception:
-        flow_score_val = 0.0
+    # Options flow je nejdražší část (15 expirací × 2 chainy na ticker). Ve sken-
+    # módu (flow=False) ho přeskočíme → /nasdaq a /darkhorse jsou násobně rychlejší
+    # a méně narážejí na rate-limit. Setup se pak skóruje technicky (bez flow bonusu).
+    flow_score_val = 0.0
+    if flow:
+        try:
+            hits, _ = analyze_options_flow(ticker, last)
+            flow_score_val, _, _ = compute_flow_score(hits) if hits else (0.0, {}, "")
+        except Exception:
+            flow_score_val = 0.0
 
     tol = atr * 0.5
     res_clusters = cluster_levels(highs, tol)
@@ -1283,10 +1319,7 @@ async def whale_radar_loop(context: ContextTypes.DEFAULT_TYPE):
     for a in fresh[:WHALE_MAX_ALERTS]:
         msg = format_whale_alert(a)
         for chat_id in list(whale_radar_chats):
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-            except Exception as e:
-                log.error("[WHALE] odeslání selhalo (chat %s): %s", chat_id, e)
+            await safe_send(context.bot, chat_id, msg)
 
 
 # ==============================================================================
@@ -1871,7 +1904,7 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
             zprava += f"🛑 *Stop:* `${stop_loss:.2f}` (Risk {risk_display:.2f}% · {stop_basis})\n"
             zprava += f"⚠️ *Sizing:* `Max 0.5% portfolia!`"
 
-            await context.bot.send_message(chat_id=context.job.chat_id, text=zprava, parse_mode="Markdown")
+            await safe_send(context.bot, context.job.chat_id, zprava)
             _walter_mark_alert(target_ticker)
             return
 
@@ -1904,8 +1937,8 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
             vol_info = "\n\n🕒 _US burza je zavřená — objem se nesleduje._"
 
         zprava_makro = f"🚨 *MARKET MACRO ALERT*\n━━━━━━━━━━━━━━━━━━━━━━\n{makro_text}{vol_info}"
-        
-        await context.bot.send_message(chat_id=context.job.chat_id, text=zprava_makro, parse_mode="Markdown")
+
+        await safe_send(context.bot, context.job.chat_id, zprava_makro)
         
     except Exception as e:
         log.error("Chyba v makro smyčce: %s", e) 
@@ -2074,7 +2107,7 @@ async def nasdaq_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async with sem:
             await asyncio.sleep(1.5)
             try:
-                result = await asyncio.to_thread(make_chart, ticker, "1d", False)
+                result = await asyncio.to_thread(make_chart, ticker, "1d", False, False)
                 if not result: return None
                 _, _, data = result
                 if not data: return None
@@ -2138,7 +2171,7 @@ async def darkhorse_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async with sem:
             await asyncio.sleep(1.5) 
             try:
-                result = await asyncio.to_thread(make_chart, ticker, "1d", False)
+                result = await asyncio.to_thread(make_chart, ticker, "1d", False, False)
                 if not result: return None
 
                 _, _, data = result
@@ -2318,10 +2351,27 @@ async def earnings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: await msg.edit_text(text, parse_mode="Markdown")
     except Exception: await msg.edit_text(text)
 
+# Ticker = 1–6 písmen, volitelně přípona jako -USD (BTC-USD) nebo .B (BRK.B).
+_TICKER_RE = re.compile(r"^[A-Z]{1,6}([.\-][A-Z]{1,4})?$")
+# Častá česká/anglická chatová slova, co vypadají jako ticker (ASCII, ≤6 písmen).
+_NON_TICKER_WORDS = {
+    "AHOJ", "DIKY", "DIK", "CO", "ANO", "NE", "JAK", "ALE", "PROC", "KDE", "KDY",
+    "JO", "JJ", "OK", "OKEJ", "DOBRE", "SUPER", "DALE", "DAL", "HELP", "TEST",
+    "HI", "HELLO", "THX", "YES", "NO", "WHY", "WHAT", "NICE", "COOL",
+    "TOHLE", "TADY", "CAU", "AHOJTE", "MOC", "VIC", "TAKE", "PAK", "UZ", "TEDY",
+}
+
 async def handle_ticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.strip().split()
+    if not parts:
+        return
     ticker = parts[0].upper()
     interval = parts[1].lower() if len(parts) > 1 else "1d"
+
+    # Filtr: běžná věta („ahoj", „díky") není ticker → tiše ignoruj, ať bot
+    # nespouští marné stahování grafu a neodpovídá chybou na každou zprávu.
+    if not _TICKER_RE.match(ticker) or ticker in _NON_TICKER_WORDS:
+        return
 
     if interval not in TF_PERIOD:
         await update.message.reply_text(f"❌ Neznámý timeframe '{interval}'.")
