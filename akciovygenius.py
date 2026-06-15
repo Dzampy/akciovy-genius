@@ -1,6 +1,7 @@
 import io
 import math
 import asyncio
+import time
 from datetime import datetime, timezone
 import os
 import re
@@ -23,6 +24,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from mtf_analysis import analyze_mtf_levels, format_level, format_zone, make_mtf_chart
 from dotenv import load_dotenv
+load_dotenv()
 
 print("\n" + "="*50)
 print("🚀 [TEST] WEBHOOK FUNGUJE! Nová verze je nasazena!")
@@ -32,8 +34,9 @@ print("="*50 + "\n")
 TOKEN = "8825645830:AAGat5gPqE16QUe2W_UQ4SrlzpyBEa10daU" 
 AV_KEY ="Q3UCP540D9VVDBBI"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# Inicializace nového klienta pro Groq
-client = Groq(api_key=GROQ_API_KEY)
+# Inicializace klienta pro Groq — jen pokud je klíč k dispozici.
+# Bez této pojistky by Groq(api_key=None) vyhodil výjimku už při startu a shodil celý bot.
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 active_snipers = {}
 # ── Timeframe konfigurace ────────────────────────────────────────────────────
@@ -138,7 +141,7 @@ def fetch_yahoo_rss(ticker: str) -> list:
 # ==============================================================================
 # 2. HLAVNÍ ENGINE (make_chart)
 # ==============================================================================
-def make_chart(ticker: str, interval: str = "1d"):
+def make_chart(ticker: str, interval: str = "1d", render: bool = True):
     if interval in ["1h", "4h"]:
         return make_sr_chart(ticker, interval)
 
@@ -204,7 +207,6 @@ def make_chart(ticker: str, interval: str = "1d"):
 
     high_52, low_52 = float(df['High'].max()), float(df['Low'].min())
     fib_618 = high_52 - 0.382 * (high_52 - low_52)
-    pos_52 = ((last - low_52) / (high_52 - low_52)) * 100 if high_52 > low_52 else 50
     is_near_ath = last >= high_52 * 0.98
 
     try:
@@ -372,7 +374,7 @@ def make_chart(ticker: str, interval: str = "1d"):
 
     fig.update_layout(title=f"🎯 {ticker.upper()} — Exekuční Setup | {interval}", template="plotly_dark", width=1100, height=850, showlegend=False, margin=dict(l=40, r=40, t=60, b=20))
     fig.update_xaxes(rangeslider_visible=False, type="category", nticks=8)
-    png = fig.to_image(format="png")
+    png = fig.to_image(format="png") if render else None
 
     score_text = "\n".join([f"  {b}" for b in best_zone_bd]) if best_zone_bd else "  Nedostatečná konfluence pro vstup"
     daily_bias = _daily_bias_from_setup(best_total_score, setup_type, status)
@@ -932,61 +934,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 last_market_text = ""
 
 def get_smc_zones(df):
-    """Vylepšená HFT funkce: Displacement filtr, Proximity filtr a přesné časové osy."""
-    bull_fvg, bear_fvg = [], []
-    bull_ob, bear_ob = [], []
-    
-    # Průměrné tělo svíčky pro filtr momenta
-    df['body'] = abs(df['Close'] - df['Open'])
-    avg_body = float(df['body'].mean())
-    current_price = float(df['Close'].iloc[-1])
-    
-    for i in range(2, len(df) - 1):
-        p2_h, p2_l = float(df['High'].iloc[i-2]), float(df['Low'].iloc[i-2])
-        c_h, c_l = float(df['High'].iloc[i]), float(df['Low'].iloc[i])
-        
-        # Svíčka musí být o 50% větší než průměr (Displacement)
-        displacement = abs(float(df['Close'].iloc[i-1]) - float(df['Open'].iloc[i-1]))
-        if displacement < avg_body * 1.5: 
-            continue
-            
-        # Bullish FVG & OB
-        if c_l > p2_h:
-            # ZMĚNA: Mitigace ihned při prvním dotyku (retestu) shora
-            mitigated = any(float(df['Low'].iloc[j]) <= c_l for j in range(i + 1, len(df)))
-            if not mitigated:
-                bull_fvg.append({'top': c_l, 'bot': p2_h, 'start_idx': df.index[i-1]})
-                for k in range(i-2, max(0, i-7), -1):
-                    if float(df['Close'].iloc[k]) < float(df['Open'].iloc[k]): 
-                        ob_t, ob_b = float(df['High'].iloc[k]), float(df['Low'].iloc[k])
-                        ob_mitig = any(float(df['Low'].iloc[m]) <= ob_t for m in range(k + 1, len(df)))
-                        if not ob_mitig: 
-                            bull_ob.append({'top': ob_t, 'bot': ob_b, 'start_idx': df.index[k]})
-                        break
-                        
-        # Bearish FVG & OB
-        if c_h < p2_l:
-            # ZMĚNA: Mitigace ihned při prvním dotyku (retestu) zdola
-            mitigated = any(float(df['High'].iloc[j]) >= c_h for j in range(i + 1, len(df)))
-            if not mitigated:
-                bear_fvg.append({'top': p2_l, 'bot': c_h, 'start_idx': df.index[i-1]})
-                for k in range(i-2, max(0, i-7), -1):
-                    if float(df['Close'].iloc[k]) > float(df['Open'].iloc[k]): 
-                        ob_t, ob_b = float(df['High'].iloc[k]), float(df['Low'].iloc[k])
-                        ob_mitig = any(float(df['High'].iloc[m]) >= ob_b for m in range(k + 1, len(df)))
-                        if not ob_mitig: 
-                            bear_ob.append({'top': ob_t, 'bot': ob_b, 'start_idx': df.index[k]})
-                        break
-                        
-    # PROXIMITY FILTER: Ponecháme jen 3 nejbližší zóny k aktuální ceně
-    bull_ob = sorted(bull_ob, key=lambda x: abs(current_price - x['top']))[:3]
-    bear_ob = sorted(bear_ob, key=lambda x: abs(current_price - x['bot']))[:3]
-    bull_fvg = sorted(bull_fvg, key=lambda x: abs(current_price - x['top']))[:3]
-    bear_fvg = sorted(bear_fvg, key=lambda x: abs(current_price - x['bot']))[:3]
-                        
-    return bull_fvg, bear_fvg, bull_ob, bear_ob
-
-def get_smc_zones(df):
     """Vylepšená HFT funkce: Displacement filtr, Proximity filtr a FIRST TOUCH mitigace."""
     bull_fvg, bear_fvg = [], []
     bull_ob, bear_ob = [], []
@@ -1174,44 +1121,6 @@ async def sniper_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def sniper_background_task(context: ContextTypes.DEFAULT_TYPE):
-    """Běží každou minutu a kontroluje, zda se sledované akcie nedotkly OB zón."""
-    for chat_id, tickers in list(active_snipers.items()):
-        for ticker in list(tickers):
-            try:
-                df = await asyncio.to_thread(yf.download, ticker, period="3d", interval="15m", progress=False)
-                if df.empty: continue
-                if isinstance(df.columns, pd.MultiIndex):
-                    df = df[ticker] if ticker in df.columns.levels[0] else df.copy()
-                    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-                
-                bull_fvg, bear_fvg, bull_ob, bear_ob = get_smc_zones(df)
-                current_price = float(df['Close'].iloc[-1])
-                current_low = float(df['Low'].iloc[-1])
-                current_high = float(df['High'].iloc[-1])
-                
-                alert_msg = ""
-                
-                # Check Bullish OB Touch
-                for ob in bull_ob:
-                    if current_low <= ob['top'] and current_price >= ob['bot']:
-                        alert_msg = f"🟢 *LONG ALERT ({ticker})*\nCena právě propíchla Bullish Order Block na úrovni `${ob['top']:.2f}`. Ideální příležitost hledat long entry setup!"
-                        break
-                        
-                # Check Bearish OB Touch
-                for ob in bear_ob:
-                    if current_high >= ob['bot'] and current_price <= ob['top']:
-                        alert_msg = f"🔴 *SHORT ALERT ({ticker})*\nCena právě zasáhla Bearish Order Block na úrovni `${ob['bot']:.2f}`. Sleduj zamítnutí pro short!"
-                        break
-
-                if alert_msg:
-                    await context.bot.send_message(chat_id=chat_id, text=f"🎯 *SMC SNIPER HIT*\n━━━━━━━━━━━━━━━━━━━━━━\n{alert_msg}", parse_mode="Markdown")
-                    # Jakmile je zóna zasažena a alert odeslán, přestaneme ticker sledovat, aby bot nespamoval.
-                    active_snipers[chat_id].remove(ticker)
-                    
-            except Exception as e:
-                print(f"Sniper chyba na {ticker}: {e}")
-
-async def sniper_background_task(context: ContextTypes.DEFAULT_TYPE):
     for chat_id, tickers in list(active_snipers.items()):
         for ticker in list(tickers):
             try:
@@ -1240,10 +1149,8 @@ async def sniper_background_task(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e: print(f"Sniper chyba: {e}")
 
 
-import time # Ujisti se, že tohle máš někde nahoře v importech, nebo to klidně nech tady
-
 # Tuhle proměnnou musíme definovat ZVENKU před funkcí, aby se na ni mohl globálně odkazovat
-last_market_text = "" 
+last_market_text = ""
 
 async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
     """Hlavní smyčka na pozadí pro makro zprávy z Telegram zrcadla (Anti-X-Ban)"""
@@ -1625,9 +1532,10 @@ async def nasdaq_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async with sem:
             await asyncio.sleep(1.5)
             try:
-                result = await asyncio.to_thread(make_chart, ticker, "1d")
-                if not result or result[0] is None: return None
+                result = await asyncio.to_thread(make_chart, ticker, "1d", False)
+                if not result: return None
                 _, text_output = result
+                if not text_output or text_output.startswith("❌"): return None
                 
                 setup_match = re.search(r"SETUP TYPE:\* `(.*?)`", text_output)
                 score_match = re.search(r"ENTRY CONFIDENCE:.*?\((\d+)/100\)", text_output)
@@ -1710,10 +1618,11 @@ async def darkhorse_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async with sem:
             await asyncio.sleep(1.5) 
             try:
-                result = await asyncio.to_thread(make_chart, ticker, "1d")
-                if not result or result[0] is None: return None
-                    
+                result = await asyncio.to_thread(make_chart, ticker, "1d", False)
+                if not result: return None
+
                 _, text = result
+                if not text or text.startswith("❌"): return None
                 
                 setup_match = re.search(r"SETUP TYPE:\* `(.*?)`", text)
                 if not setup_match or "No Setup" in setup_match.group(1): return None 
@@ -1833,6 +1742,8 @@ async def whales_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  • *{r['ticker'].ljust(5)}* {sign}{r['flow_strength']:.4f}%")
 
     lines.extend(["━━━━━━━━━━━━━━━━━━━━━━", "🎯 *TOP SETUPY* _(Nejvyšší přesvědčení)_"])
+    if zero_count > 0:
+        lines.append(f"_(Skryto {zero_count} tickerů bez výrazné aktivity)_")
     for r in by_score:
         fs = r["flow_score"]
         if fs >= 0.6: verdict = "🔥 VERY STRONG BULLISH"
@@ -2029,7 +1940,13 @@ def main():
     app.add_handler(MessageHandler(filters.Document.PDF & filters.CaptionRegex(r'^/ai'), ai_pdf_cmd))
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ticker))
-    
+
+    # Naplánuj SMC Sniper skener na pozadí (každou minutu), pokud je JobQueue dostupná
+    if app.job_queue:
+        app.job_queue.run_repeating(sniper_background_task, interval=60, first=15, name="sniper_job")
+    else:
+        print("⚠️  JobQueue není dostupná – SMC Sniper na pozadí poběží jen po /sniper. Nainstaluj python-telegram-bot[job-queue].")
+
     print("✅ Bot běží. Zastav pomocí Ctrl+C.")
     app.run_polling()
     
