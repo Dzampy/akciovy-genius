@@ -1278,11 +1278,14 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
         Jsi HFT quant algoritmus. Přečti si tuto bleskovou zprávu:
         "{text_tweetu}"
         
-        Urči, zda pojednává o konkrétní akcii, nebo o makroekonomickém trhu obecně. 
+        Urči, zda má tato zpráva reálný dopad na americký akciový trh (NASDAQ, technologické akcie) nebo krypto.
+        Ignoruj lokální zprávy z Evropy a Asie (např. švýcarské ceny, lokální ekonomika mimo USA), pokud nemají globální vliv.
+        Pokud zpráva nemá vliv na US trh, označ typ jako "ignore".
+        
         Odpověz POUZE v čistém formátu JSON:
         {{
-            "typ": "akcie" nebo "makro",
-            "ticker": "TICKER" (pokud jde o akcie, napiš ticker, např. AAPL, ONDS. Pokud je to makro, napiš vždy "NVDA"),
+            "typ": "akcie", "makro" nebo "ignore",
+            "ticker": "TICKER" (pokud akcie, napiš ticker. Pokud makro, napiš "NVDA". Pokud ignore, napiš "NONE"),
             "sentiment": "bullish" nebo "bearish" nebo "neutral",
             "duvod": "stručný důvod 1 větou"
         }}
@@ -1300,7 +1303,12 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
         try:
             analyza = json.loads(ai_text)
         except Exception:
-            analyza = {"typ": "makro", "ticker": "NVDA", "sentiment": "neutral", "duvod": "Neznámý"}
+            analyza = {"typ": "ignore", "ticker": "NONE", "sentiment": "neutral", "duvod": "Chyba parsování"}
+            
+        # Zastavení nesmyslných zpráv hned na začátku
+        if analyza.get("typ") == "ignore":
+            print(f"Walter zahodil irelevantní zprávu: {text_tweetu}")
+            return
             
         # --- FÁZE 2: UNIVERZÁLNÍ VOLUME SPIKE ---
         from datetime import datetime
@@ -1312,7 +1320,7 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
             target_ticker = "BTC-USD"
             is_macro = True 
         else:
-            if not target_ticker or str(target_ticker).lower() == "null":
+            if not target_ticker or str(target_ticker).lower() == "none" or str(target_ticker).lower() == "null":
                 target_ticker = "NVDA"
             else:
                 target_ticker = target_ticker.upper()
@@ -1326,6 +1334,9 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
         stop_loss = 0.0
         smer = ""
         ma_data = False
+        
+        # Pevný risk pro volatilitu (0.8 %) místo hloupého 5min low
+        FIXED_RISK_PCT = 0.008 
 
         if target_ticker == "BTC-USD":
             try:
@@ -1335,18 +1346,17 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
                     k_data = resp_binance.json()
                     closes = [float(k[4]) for k in k_data]
                     volumes = [float(k[5]) for k in k_data]
-                    lows = [float(k[3]) for k in k_data]
-                    highs = [float(k[2]) for k in k_data]
                     
                     if len(volumes) == 11:
                         aktualni_cena = closes[-1]
                         aktualni_vol = volumes[-1]
                         prumer_vol_10m = sum(volumes[:-1]) / 10
+                        
                         if sentiment == "bullish":
-                            stop_loss = min(lows[-5:])
+                            stop_loss = aktualni_cena * (1 - FIXED_RISK_PCT)
                             smer = "LONG 🟢"
                         else:
-                            stop_loss = max(highs[-5:])
+                            stop_loss = aktualni_cena * (1 + FIXED_RISK_PCT)
                             smer = "SHORT 🔴"
                         ma_data = True
             except Exception as e:
@@ -1367,16 +1377,17 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
                     aktualni_cena = float(data_1m['Close'].iloc[-1])
                     aktualni_vol = float(data_1m['Volume'].iloc[-1])
                     prumer_vol_10m = float(data_1m['Volume'].tail(11).head(10).mean())
+                    
                     if sentiment == "bullish":
-                        stop_loss = float(data_1m['Low'].tail(5).min())
+                        stop_loss = aktualni_cena * (1 - FIXED_RISK_PCT)
                         smer = "LONG 🟢"
                     else:
-                        stop_loss = float(data_1m['High'].tail(5).max())
+                        stop_loss = aktualni_cena * (1 + FIXED_RISK_PCT)
                         smer = "SHORT 🔴"
                     ma_data = True
 
         if ma_data and prumer_vol_10m > 0 and (aktualni_vol > prumer_vol_10m * 3) and sentiment in ["bullish", "bearish"]:
-            risk_pct = abs(aktualni_cena - stop_loss) / aktualni_cena * 100
+            risk_display = abs(aktualni_cena - stop_loss) / aktualni_cena * 100
             
             zprava = f"⚡ *NEWS ENTRY DETECTED: {target_ticker}*\n"
             zprava += f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1392,7 +1403,7 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
                 
             zprava += f"🎯 *Akce:* `{smer}`\n"
             zprava += f"💵 *Vstup:* `${aktualni_cena:.2f}`\n"
-            zprava += f"🛑 *Stop:* `${stop_loss:.2f}` (Risk {risk_pct:.2f}%)\n"
+            zprava += f"🛑 *Stop:* `${stop_loss:.2f}` (Risk {risk_display:.2f}%)\n"
             zprava += f"⚠️ *Sizing:* `Max 0.5% portfolia!`"
             
             await context.bot.send_message(chat_id=context.job.chat_id, text=zprava, parse_mode="Markdown")
