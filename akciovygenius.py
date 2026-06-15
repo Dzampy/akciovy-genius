@@ -4,6 +4,8 @@ import asyncio
 import time
 import json
 import hashlib
+import threading
+import atexit
 import logging
 from datetime import datetime, timezone
 import os
@@ -94,6 +96,21 @@ OPT_MIN_PREMIUM = float(os.getenv("OPT_MIN_PREMIUM", "50000"))  # min. prémie b
 OPT_MAX_EXPIRATIONS = int(os.getenv("OPT_MAX_EXPIRATIONS", "15"))  # kolik nejbližších expirací projít
 OPT_DTE_MIN = int(os.getenv("OPT_DTE_MIN", "7"))             # min. dní do expirace
 OPT_DTE_MAX = int(os.getenv("OPT_DTE_MAX", "90"))            # max. dní do expirace
+
+# ── Flow paměť (akumulace/distribuce v čase) ──────────────────────────────────
+# Engine si pamatuje denní stav každého neobvyklého strike → pozná, jestli někdo
+# pozici teprve staví (akumulace) nebo opouští (distribuce), ne jen jednorázový blok.
+FLOW_HISTORY_FILE = "flow_history.json"
+FLOW_HISTORY_DAYS = int(os.getenv("FLOW_HISTORY_DAYS", "10"))             # okno paměti (dní)
+FLOW_HISTORY_MAX_KEYS = int(os.getenv("FLOW_HISTORY_MAX_KEYS", "4000"))   # strop záznamů (strike-klíčů)
+FLOW_ACCUM_MIN_DAYS = int(os.getenv("FLOW_ACCUM_MIN_DAYS", "2"))          # min. dní pro „akumulaci"
+FLOW_ACCUM_OI_GROWTH = float(os.getenv("FLOW_ACCUM_OI_GROWTH", "1.3"))    # OI růst (×) = akumulace
+FLOW_DISTRIB_OI_DROP = float(os.getenv("FLOW_DISTRIB_OI_DROP", "0.6"))    # OI pokles (×) = distribuce
+
+_flow_history: dict = {}           # {ticker|type|strike|exp: {ticker,opt_type,strike,exp,history[],last_seen}}
+_flow_lock = threading.Lock()      # chrání _flow_history (engine běží ve více vláknech přes to_thread)
+_flow_dirty = False                # je co flushnout na disk?
+_flow_loaded = False               # už jsme načetli z disku?
 
 _WHALE_RADAR_FILE = "whale_radar.json"
 whale_radar_chats: set = set()     # chat_id odběratelů radaru (perzistované)
@@ -1022,6 +1039,145 @@ def exec_label(last: float, bid: float, ask: float) -> str:
     if last <= midpoint - spread * 0.15: return "↘️ pod mid"
     return "➡️ midpoint"
 
+# ── Flow paměť: perzistence denních snapshotů + detekce akumulace/distribuce ──
+def _et_today() -> str:
+    """Dnešní datum v US/Eastern (ISO). Trh i opce žijí v ET, ne v UTC."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:
+        return datetime.now(timezone.utc).date().isoformat()
+
+
+def load_flow_history() -> None:
+    """Líně načte flow paměť z disku (jednou). Po načtení rovnou prořeže."""
+    global _flow_history, _flow_loaded
+    with _flow_lock:
+        if _flow_loaded:
+            return
+        try:
+            if os.path.exists(FLOW_HISTORY_FILE):
+                with open(FLOW_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    _flow_history = json.load(f)
+        except Exception as e:
+            log.error("Chyba při načítání flow paměti: %s", e)
+            _flow_history = {}
+        _flow_loaded = True
+    _prune_flow_history()
+
+
+def save_flow_history() -> None:
+    """Atomicky uloží paměť na disk — jen když je co (dirty). Bezpečné z více vláken."""
+    global _flow_dirty
+    with _flow_lock:
+        if not _flow_dirty:
+            return
+        snapshot = json.dumps(_flow_history)
+        _flow_dirty = False
+    try:
+        tmp = FLOW_HISTORY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(snapshot)
+        os.replace(tmp, FLOW_HISTORY_FILE)   # atomická výměna → nikdy půlka souboru
+    except Exception as e:
+        log.error("Nepodařilo se uložit flow paměť: %s", e)
+
+
+def _prune_flow_history() -> None:
+    """Vyhodí expirované strikes, staré denní záznamy a přebytek nad strop."""
+    global _flow_history
+    today = _et_today()
+    with _flow_lock:
+        dead = []
+        for key, rec in _flow_history.items():
+            exp = rec.get("exp", "")
+            if exp and exp < today:                  # opce už vypršela → pryč celá
+                dead.append(key)
+                continue
+            hist = rec.get("history", [])
+            if len(hist) > FLOW_HISTORY_DAYS:        # ořež okno paměti
+                rec["history"] = hist[-FLOW_HISTORY_DAYS:]
+        for key in dead:
+            del _flow_history[key]
+        if len(_flow_history) > FLOW_HISTORY_MAX_KEYS:   # strop: drž nejčerstvěji viděné
+            ordered = sorted(_flow_history.items(),
+                             key=lambda kv: kv[1].get("last_seen", ""), reverse=True)
+            _flow_history = dict(ordered[:FLOW_HISTORY_MAX_KEYS])
+
+
+def record_flow_snapshot(ticker: str, hits: list[dict]) -> None:
+    """Zapíše dnešní stav každého bloku do paměti (1 záznam/strike/den, jen do RAM).
+    Na disk se flushne jinde (save_flow_history) — tady jen levný update pod zámkem."""
+    if not hits:
+        return
+    load_flow_history()
+    today = _et_today()
+    global _flow_dirty
+    with _flow_lock:
+        for h in hits:
+            key = f"{ticker}|{h['opt_type']}|{h['strike']}|{h['exp']}"
+            snap = {
+                "date": today,
+                "oi": int(h.get("oi", 0)),
+                "volume": int(h.get("volume", 0)),
+                "premium": float(h.get("premium", 0.0)),
+                "wscore": float(h.get("wscore", 0.0)),
+                "bscore": int(h.get("bscore_sum", 0)),
+            }
+            rec = _flow_history.get(key)
+            if rec is None:
+                _flow_history[key] = {
+                    "ticker": ticker, "opt_type": h["opt_type"],
+                    "strike": float(h["strike"]), "exp": h["exp"],
+                    "history": [snap], "last_seen": today,
+                }
+            else:
+                hist = rec["history"]
+                if hist and hist[-1]["date"] == today:
+                    hist[-1] = snap                  # přepiš dnešní (poslední = nejaktuálnější)
+                else:
+                    hist.append(snap)
+                    del hist[:-FLOW_HISTORY_DAYS]
+                rec["last_seen"] = today
+            _flow_dirty = True
+
+
+def _accum_from_history(hist: list[dict]) -> dict | None:
+    """Z denní historie strike spočítá trend: label + růst OI/prémie + počet dní."""
+    if not hist:
+        return None
+    days = len({s["date"] for s in hist})
+    first, last = hist[0], hist[-1]
+    oi_growth = last["oi"] / first["oi"] if first.get("oi", 0) > 0 else 1.0
+    prem_growth = last["premium"] / first["premium"] if first.get("premium", 0) > 0 else 1.0
+    cum_premium = sum(s.get("premium", 0.0) for s in hist)   # kolik se do strike celkem „nalilo"
+
+    if days < FLOW_ACCUM_MIN_DAYS:
+        label = "🆕 Nový"
+    elif oi_growth >= FLOW_ACCUM_OI_GROWTH and prem_growth >= 1.0:
+        label = "🟢 Akumulace"
+    elif oi_growth <= FLOW_DISTRIB_OI_DROP:
+        label = "🔴 Distribuce"
+    else:
+        label = "➡️ Stabilní"
+
+    return {
+        "label": label, "days": days,
+        "oi_growth": oi_growth, "prem_growth": prem_growth,
+        "cum_premium": cum_premium,
+        "is_accum": label == "🟢 Akumulace",
+    }
+
+
+def flow_accumulation(ticker: str, opt_type: str, strike: float, exp: str) -> dict | None:
+    """Trend pro konkrétní strike z paměti. None = žádná historie."""
+    key = f"{ticker}|{opt_type}|{strike}|{exp}"
+    with _flow_lock:
+        rec = _flow_history.get(key)
+        hist = list(rec["history"]) if rec else []
+    return _accum_from_history(hist)
+
+
 def analyze_options_flow(ticker: str, spot: float) -> tuple[list[dict], float]:
     if spot <= 0: return [], 0.0
     tk = yf.Ticker(ticker)
@@ -1097,7 +1253,13 @@ def analyze_options_flow(ticker: str, spot: float) -> tuple[list[dict], float]:
     if not agg: return [], market_cap
     results = list(agg.values())
     results.sort(key=lambda x: x["wscore"], reverse=True)
-    return results[:12], market_cap
+    top = results[:12]
+
+    # Engine má paměť: ulož dnešní stav a obohať bloky o trend (akumulace/distribuce).
+    record_flow_snapshot(ticker, top)
+    for h in top:
+        h["accum"] = flow_accumulation(ticker, h["opt_type"], h["strike"], h["exp"])
+    return top, market_cap
 
 def compute_flow_score(hits: list[dict]) -> tuple[float, dict, str]:
     buckets = {"bull_call": 0.0, "bear_call": 0.0, "bull_put":  0.0, "bear_put":  0.0, "neutral":   0.0}
@@ -1164,8 +1326,12 @@ def format_unusual(ticker: str, hits: list[dict], spot: float, market_cap: float
         "",
         f"🌡 *FlowScore:* `{flow_score:+.2f}` — {fs_label}",
         f"🛡 *Důvěra:* {confidence}",
-        "━━━━━━━━━━━━━━━━━━━━━━"
     ])
+
+    accum_hits = [h for h in hits if (h.get("accum") or {}).get("is_accum")]
+    if accum_hits:
+        lines.append(f"🧲 *Akumulace:* `{len(accum_hits)}` strike(ů) se nabaluje víc dní po sobě")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
 
     for i, h in enumerate(hits, 1):
         ot_emoji = "📞 CALL" if h["opt_type"] == "call" else "📉 PUT"
@@ -1184,11 +1350,20 @@ def format_unusual(ticker: str, hits: list[dict], spot: float, market_cap: float
         elif bs == -1: sent = "↘️ Mírně Bearish"
         else: sent = "🧊 Bearish"
 
+        accum = h.get("accum")
+        accum_line = ""
+        if accum and accum["days"] >= FLOW_ACCUM_MIN_DAYS:
+            accum_line = (
+                f"  {accum['label']} • `{accum['days']}` dní | "
+                f"OI ×{accum['oi_growth']:.1f} | Σprémie {fmt_usd(accum['cum_premium'])}\n"
+            )
+
         lines.append(
             f"*{i}.* {ot_emoji} *${h['strike']:.0f}* | Exp: {h['exp']} ({h['dte']}d){sweep_str}\n"
             f"  💰 Prémium: `{fmt_usd(h['premium'])}` | IV: {h['iv']}% {em_str}\n"
             f"  📊 Vol: {h['volume']:,} | OI: {h['oi']:,} | Ratio: `{h['ratio']}×`\n"
             f"  🏷 {h['moneyness']} | 🎯 {pct_diff:+.1f}% od ceny\n"
+            f"{accum_line}"
             f"  🛠 B/A: {bid_ask} | Last: ${h['last']:.2f}\n"
             f"  🧭 {exec_label(h['last'], h['bid'], h['ask'])} | Sentiment: {sent}\n"
         )
@@ -1303,6 +1478,7 @@ def scan_ticker_whales(ticker: str) -> list[dict]:
             "exp": h["exp"], "dte": h["dte"], "premium": h["premium"], "iv": h["iv"],
             "volume": h["volume"], "oi": h["oi"], "ratio": h["ratio"],
             "aggr": aggr, "bullish": bull, "spot": spot,
+            "accum": h.get("accum"),
             "key": f"{ticker}|{h['opt_type']}|{h['strike']}|{h['exp']}",
         })
     return out
@@ -1312,7 +1488,18 @@ def format_whale_alert(a: dict) -> str:
     side = "CALLS" if a["opt_type"] == "call" else "PUTS"
     direction = "📈 Bullish sázka" if a["bullish"] else "📉 Bearish sázka"
     aggr_lbl = "na asku (agresivní)" if a["aggr"] >= 0.85 else "blízko asku"
-    head = "🐳 *MEGA WHALE*" if a["premium"] >= 5_000_000 else "🐋 *WHALE ALERT*"
+
+    accum = a.get("accum")
+    if accum and accum.get("is_accum"):
+        head = "🐋🧲 *WHALE — AKUMULACE*"
+        accum_line = (
+            f"\n🧲 *{accum['days']}. den nabalování!* "
+            f"OI ×{accum['oi_growth']:.1f} | Σ prémie {fmt_usd(accum['cum_premium'])}"
+        )
+    else:
+        head = "🐳 *MEGA WHALE*" if a["premium"] >= 5_000_000 else "🐋 *WHALE ALERT*"
+        accum_line = ""
+
     return (
         f"{head}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1320,6 +1507,7 @@ def format_whale_alert(a: dict) -> str:
         f"🎯 Strike `${a['strike']:.2f}` | exp {a['exp']} (`{a['dte']}` DTE)\n"
         f"📊 Vol `{a['volume']:,}` / OI `{a['oi']:,}` (`{a['ratio']}×`) | IV {a['iv']}%\n"
         f"💵 Spot `${a['spot']:.2f}` | {direction}"
+        f"{accum_line}"
     )
 
 
@@ -1341,16 +1529,26 @@ async def whale_radar_loop(context: ContextTypes.DEFAULT_TYPE):
     _whale_scan_idx = (start + WHALE_CHUNK) % len(universe)
 
     results = await scan_universe(chunk, scan_ticker_whales, delay=SCAN_DELAY_FLOW)
+    await asyncio.to_thread(save_flow_history)     # sken naplnil paměť → flushni na disk
+
     alerts = [a for sub in results if sub for a in sub]
     fresh = [a for a in alerts if _whale_dedup_ok(a["key"])]
     if not fresh:
         return
 
-    fresh.sort(key=lambda a: a["premium"], reverse=True)
+    # Vícedenní akumulace má přednost před jednorázovým blokem (silnější signál).
+    fresh.sort(key=lambda a: ((a.get("accum") or {}).get("is_accum", False), a["premium"]), reverse=True)
     for a in fresh[:WHALE_MAX_ALERTS]:
         msg = format_whale_alert(a)
         for chat_id in list(whale_radar_chats):
             await safe_send(context.bot, chat_id, msg)
+
+
+async def flow_history_flush_job(context: ContextTypes.DEFAULT_TYPE):
+    """Pravidelně prořeže a uloží flow paměť (i když radar zrovna neběží).
+    Oba kroky jsou no-op, když není co dělat → levné."""
+    await asyncio.to_thread(_prune_flow_history)
+    await asyncio.to_thread(save_flow_history)
 
 
 # ==============================================================================
@@ -1386,7 +1584,8 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• `/darkhorse` – skryté příležitosti z Russell 2000\n"
         "• `/whales` – ranní whale-flow skener\n"
         "• `/whaleradar on` – 🐋 živý radar velkých opčních bloků (celý trh)\n"
-        "• `/unusual AAPL` – neobvyklá opční aktivita\n"
+        "• `/unusual AAPL` – neobvyklá opční aktivita (+ akumulace v čase)\n"
+        "• `/akumulace` – 🧲 strikes, co se nabalují víc dní (volitelně `/akumulace PLTR`)\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "*🤖 AI & fundament*\n"
         "• `/news ONDS` – AI sentiment z nejnovějších zpráv\n"
@@ -2250,6 +2449,7 @@ async def unusual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         current_price = float(hist["Close"].iloc[-1])
         hits, market_cap = await asyncio.wait_for(asyncio.to_thread(analyze_options_flow, ticker, current_price), timeout=30.0)
         text = format_unusual(ticker, hits, current_price, market_cap)
+        await asyncio.to_thread(save_flow_history)   # zapiš dnešní snapshot do paměti
     except asyncio.TimeoutError:
         text = f"❌ Skenování trvalo moc dlouho."
     except Exception as e:
@@ -2310,8 +2510,58 @@ async def whales_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f" 📌 Verdikt: {verdict}\n"
         )
 
+    await asyncio.to_thread(save_flow_history)   # sken naplnil flow paměť
+
     try: await msg.edit_text("\n".join(lines), parse_mode="Markdown")
     except Exception: await msg.edit_text("\n".join(lines).replace("*", "").replace("_", "").replace("`", ""))
+
+
+async def akumulace_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Co se právě nabaluje: strikes s vícedenní akumulací napříč pamětí enginu.
+    Volitelně filtruj na ticker: `/akumulace PLTR`."""
+    load_flow_history()
+    ticker_filter = ctx.args[0].upper() if ctx.args else None
+
+    with _flow_lock:
+        items = [(k, dict(v)) for k, v in _flow_history.items()]
+
+    rows = []
+    for _key, rec in items:
+        if ticker_filter and rec.get("ticker") != ticker_filter:
+            continue
+        accum = _accum_from_history(rec.get("history", []))
+        if not accum or not accum["is_accum"]:
+            continue
+        rows.append((rec, accum))
+
+    if not rows:
+        scope = f" pro *{ticker_filter}*" if ticker_filter else ""
+        await update.message.reply_text(
+            f"🧲 *Akumulace{scope}*\n"
+            f"Zatím nic, co by se nabalovalo víc dní po sobě.\n"
+            f"_Paměť se plní průběžně, jak běží whale radar a skenery — vrať se za pár dní._",
+            parse_mode="Markdown")
+        return
+
+    rows.sort(key=lambda r: r[1]["cum_premium"], reverse=True)
+
+    scope = f" — {ticker_filter}" if ticker_filter else ""
+    lines = [
+        f"🧲 *AKUMULACE{scope}* — co se právě nabaluje",
+        "_(strikes s rostoucím OI/prémií víc dní po sobě = někdo staví pozici)_",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for rec, accum in rows[:12]:
+        ot = "📞 C" if rec["opt_type"] == "call" else "📉 P"
+        lines.append(
+            f"*{rec['ticker']}* {ot} `${rec['strike']:.0f}` | exp {rec['exp']}\n"
+            f"  {accum['label']} `{accum['days']}` dní | OI ×{accum['oi_growth']:.1f} | "
+            f"prémie ×{accum['prem_growth']:.1f} | Σ {fmt_usd(accum['cum_premium'])}\n"
+        )
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💡 _Vícedenní akumulace > jednorázový blok. Sleduj, kam plynou peníze opakovaně._")
+    await reply_long(update.message, "\n".join(lines))
+
 
 async def whaleradar_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Zapne/vypne proaktivní Whale Radar pro tento chat."""
@@ -2532,6 +2782,12 @@ def main():
     if whale_radar_chats:
         log.info("Obnoveno %d chatů s aktivním Whale Radarem.", len(whale_radar_chats))
 
+    # Obnov flow paměť (akumulace/distribuce) z minulého běhu
+    load_flow_history()
+    if _flow_history:
+        log.info("Obnoveno %d strike-záznamů ve flow paměti.", len(_flow_history))
+    atexit.register(save_flow_history)   # při vypnutí dolož poslední stav na disk
+
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -2547,6 +2803,7 @@ def main():
     app.add_handler(CommandHandler("sniper", sniper_cmd))
     app.add_handler(CommandHandler("darkhorse", darkhorse_cmd))
     app.add_handler(CommandHandler("whales", whales_cmd))
+    app.add_handler(CommandHandler(["akumulace", "accumulation"], akumulace_cmd))
     app.add_handler(CommandHandler("whaleradar", whaleradar_cmd))
     app.add_handler(CommandHandler("ai", ai_pdf_cmd))
     app.add_handler(MessageHandler(filters.Document.PDF & filters.CaptionRegex(r'^/ai'), ai_pdf_cmd))
@@ -2560,6 +2817,7 @@ def main():
     if app.job_queue:
         app.job_queue.run_repeating(sniper_background_task, interval=60, first=15, name="sniper_job")
         app.job_queue.run_repeating(whale_radar_loop, interval=WHALE_RADAR_INTERVAL, first=30, name="whale_radar_job")
+        app.job_queue.run_repeating(flow_history_flush_job, interval=120, first=120, name="flow_flush_job")
     else:
         log.warning("JobQueue není dostupná – SMC Sniper poběží jen po /sniper. Nainstaluj python-telegram-bot[job-queue].")
 

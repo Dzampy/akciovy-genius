@@ -73,6 +73,38 @@ def test_compute_flow_score_bullish():
     assert confidence == "🟡 Střední"   # premium >= 1M
 
 
+def _snap(date, oi, premium):
+    return {"date": date, "oi": oi, "volume": oi, "premium": float(premium),
+            "wscore": 0.0, "bscore": 2}
+
+
+def test_accum_empty_and_new():
+    # prázdná historie → None
+    assert ag._accum_from_history([]) is None
+    # jeden den → "nový", ne akumulace
+    new = ag._accum_from_history([_snap("2026-06-15", 1000, 500_000)])
+    assert new["days"] == 1
+    assert new["is_accum"] is False
+
+
+def test_accum_detects_accumulation():
+    hist = [_snap("2026-06-12", 1000, 400_000),
+            _snap("2026-06-13", 1800, 700_000),
+            _snap("2026-06-15", 2600, 1_200_000)]
+    a = ag._accum_from_history(hist)
+    assert a["is_accum"] is True
+    assert a["days"] == 3
+    assert abs(a["oi_growth"] - 2.6) < 1e-9
+    assert abs(a["cum_premium"] - 2_300_000) < 1.0
+
+
+def test_accum_detects_distribution():
+    hist = [_snap("2026-06-12", 5000, 900_000), _snap("2026-06-15", 1500, 200_000)]
+    a = ag._accum_from_history(hist)
+    assert a["label"] == "🔴 Distribuce"
+    assert a["is_accum"] is False
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
