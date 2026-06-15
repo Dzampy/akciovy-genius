@@ -16,6 +16,10 @@ import plotly.graph_objects as go
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 from plotly.subplots import make_subplots
+import plotly.io as pio
+
+# Vypnutí sandboxu, aby mohl prohlížeč v Dockeru vygenerovat graf
+pio.kaleido.scope.chromium_args += ("--no-sandbox", "--disable-dev-shm-usage")
 
 from mtf_analysis import analyze_mtf_levels, format_level, format_zone, make_mtf_chart
 from dotenv import load_dotenv
