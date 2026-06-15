@@ -1201,15 +1201,26 @@ def get_smc_zones(df):
     avg_body = float(body.mean()) if n else 0.0
     current_price = float(closes[-1])
 
-    def is_mitigated(top, bot, start_pos, direction):
-        """Zóna zasažena, jakmile pozdější svíčka uzavře přes 50 % (mid) zóny."""
+    def zone_status(top, bot, start_pos, direction):
+        """Stav zóny od jejího vzniku:
+        - 'broken' = cena UZAVŘELA úplně skrz (bull pod bot / bear nad top) → neplatná
+        - 'tapped' = cena se dotkla/uzavřela přes 50 % zóny, ale neprolomila
+        - 'fresh'  = zóna ještě netknutá
+        """
         mid = (top + bot) / 2.0
+        tapped = False
         for j in range(start_pos + 1, n):
-            if direction == 'bull' and closes[j] <= mid:
-                return True
-            if direction == 'bear' and closes[j] >= mid:
-                return True
-        return False
+            if direction == 'bull':
+                if closes[j] < bot:
+                    return 'broken'
+                if closes[j] <= mid:
+                    tapped = True
+            else:
+                if closes[j] > top:
+                    return 'broken'
+                if closes[j] >= mid:
+                    tapped = True
+        return 'tapped' if tapped else 'fresh'
 
     # --- ORDER BLOCKS (přes displacement, nezávisle na FVG) ---
     for i in range(1, n - 1):
@@ -1222,9 +1233,10 @@ def get_smc_zones(df):
                     ob_t, ob_b = float(highs[k]), float(lows[k])
                     if highs[i] <= ob_t:
                         break  # impulz neprorazil nad OB → neplatné
+                    status = zone_status(ob_t, ob_b, i, 'bull')
                     bull_ob.append({'top': ob_t, 'bot': ob_b, 'start_idx': idx[k],
-                                    'vol': float(vols[k]),
-                                    'mitigated': is_mitigated(ob_t, ob_b, i, 'bull')})
+                                    'vol': float(vols[k]), 'status': status,
+                                    'mitigated': status == 'tapped'})
                     break
         elif closes[i] < opens[i]:
             # bearish OB = poslední bullish svíčka před down-impulzem
@@ -1233,21 +1245,24 @@ def get_smc_zones(df):
                     ob_t, ob_b = float(highs[k]), float(lows[k])
                     if lows[i] >= ob_b:
                         break
+                    status = zone_status(ob_t, ob_b, i, 'bear')
                     bear_ob.append({'top': ob_t, 'bot': ob_b, 'start_idx': idx[k],
-                                    'vol': float(vols[k]),
-                                    'mitigated': is_mitigated(ob_t, ob_b, i, 'bear')})
+                                    'vol': float(vols[k]), 'status': status,
+                                    'mitigated': status == 'tapped'})
                     break
 
     # --- FVG (3-svíčkový gap) ---
     for i in range(2, n):
         if lows[i] > highs[i - 2]:  # bullish FVG
             top, bot = float(lows[i]), float(highs[i - 2])
+            status = zone_status(top, bot, i, 'bull')
             bull_fvg.append({'top': top, 'bot': bot, 'start_idx': idx[i - 1],
-                             'mitigated': is_mitigated(top, bot, i, 'bull')})
+                             'status': status, 'mitigated': status == 'tapped'})
         if highs[i] < lows[i - 2]:  # bearish FVG
             top, bot = float(lows[i - 2]), float(highs[i])
+            status = zone_status(top, bot, i, 'bear')
             bear_fvg.append({'top': top, 'bot': bot, 'start_idx': idx[i - 1],
-                             'mitigated': is_mitigated(top, bot, i, 'bear')})
+                             'status': status, 'mitigated': status == 'tapped'})
 
     def dedup(zones):
         seen, out = set(), []
@@ -1258,9 +1273,10 @@ def get_smc_zones(df):
                 out.append(z)
         return out
 
-    # FRESH FIRST + PROXIMITY: nezasažené zóny mají přednost, pak nejbližší k ceně
+    # Zahoď prolomené (broken) zóny — jsou neplatné, nekreslíme je.
+    # FRESH FIRST + PROXIMITY: nezasažené mají přednost, pak nejbližší k ceně.
     def rank(zones, edge):
-        zones = dedup(zones)
+        zones = [z for z in dedup(zones) if z.get('status') != 'broken']
         return sorted(zones, key=lambda z: (z.get('mitigated', False),
                                             abs(current_price - z[edge])))[:3]
 
