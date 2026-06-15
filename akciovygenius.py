@@ -70,6 +70,19 @@ WALTER_DEDUP_HISTORY = int(os.getenv("WALTER_DEDUP_HISTORY", "30"))  # kolik pos
 # Max stáří zóny (v svíčkách), kterou ještě kreslíme — starší = stale, zaneřádí graf.
 SMC_ZONE_MAX_AGE = int(os.getenv("SMC_ZONE_MAX_AGE", "60"))
 
+# ── Whale Radar konfigurace ───────────────────────────────────────────────────
+# Proaktivní skener celého trhu na velké agresivní opční bloky (lov cizích signálů).
+WHALE_RADAR_INTERVAL = int(os.getenv("WHALE_RADAR_INTERVAL", "180"))   # interval cyklu (s)
+WHALE_MIN_PREMIUM = float(os.getenv("WHALE_MIN_PREMIUM", "1000000"))   # min. prémium bloku ($)
+WHALE_MIN_AGGR = float(os.getenv("WHALE_MIN_AGGR", "0.6"))             # min. agrese (0=bid, 1=ask)
+WHALE_CHUNK = int(os.getenv("WHALE_CHUNK", "12"))                      # tickerů na jeden cyklus
+WHALE_MAX_ALERTS = int(os.getenv("WHALE_MAX_ALERTS", "5"))             # max alertů na cyklus
+
+_WHALE_RADAR_FILE = "whale_radar.json"
+whale_radar_chats: set = set()     # chat_id odběratelů radaru (perzistované)
+_whale_scan_idx = 0                # rotující ukazatel do univerza tickerů
+_whale_seen = {}                   # {klíč bloku: ISO datum} — denní dedup
+
 # Runtime stav pro Walter (rate-limiting alertů na ticker)
 _walter_last_alert = {}            # {ticker: timestamp posledního alertu}
 _WALTER_SEEN_FILE = "walter_seen.json"
@@ -258,6 +271,17 @@ NASDAQ_100 = [
     "REGN", "ROP", "ROST", "SBUX", "SHOP", "SNPS", "STX", "TEAM", "TMUS", "TRI", 
     "TSLA", "TTWO", "TXN", "VRSK", "VRTX", "WMT", "XEL"
 ]
+
+# Smallcap / momentum watchlist (sdílený mezi /whales a Whale Radarem)
+WHALE_SMALLCAPS = [
+    "ASTS", "RKLB", "LUNR", "ONDS", "SOUN", "IONQ", "RGTI", "QBTS",
+    "ACHR", "JOBY", "LPTH", "UMAC", "AMPX", "KOPN", "SPAI", "LTRX",
+    "SRFM", "DPRO", "CEG", "NOK", "AAOI", "DDD", "BBAI", "RDW",
+    "SATL", "HOOD", "OKLO"
+]
+
+# Univerzum pro proaktivní Whale Radar (NASDAQ-100 + smallcapy, bez duplicit)
+WHALE_UNIVERSE = list(dict.fromkeys(NASDAQ_100 + WHALE_SMALLCAPS))
 
 # ── S/R a Pomocné funkce ─────────────────────────────────────────────────────
 def find_pivots(df, window=10):
@@ -1134,6 +1158,132 @@ async def get_net_whale_flow(ticker: str) -> dict:
     except Exception:
         return None
 
+
+# ── Whale Radar: perzistence odběrů, dedup, skener, formát ────────────────────
+def load_whale_chats() -> set:
+    """Načte odběratele Whale Radaru z disku (přežije restart)."""
+    try:
+        with open(_WHALE_RADAR_FILE, "r", encoding="utf-8") as f:
+            return {int(x) for x in json.load(f)}
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        log.error("Chyba při načítání whale radaru: %s", e)
+        return set()
+
+
+def save_whale_chats() -> None:
+    try:
+        with open(_WHALE_RADAR_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(whale_radar_chats), f)
+    except Exception as e:
+        log.error("Nepodařilo se uložit whale radar: %s", e)
+
+
+def _whale_dedup_ok(key: str) -> bool:
+    """True, pokud tento blok dnes ještě nebyl odeslán. Paměť se resetuje denně."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    # vyčisti záznamy z předchozích dnů
+    for k in [k for k, d in _whale_seen.items() if d != today]:
+        del _whale_seen[k]
+    if _whale_seen.get(key) == today:
+        return False
+    _whale_seen[key] = today
+    return True
+
+
+def scan_ticker_whales(ticker: str) -> list[dict]:
+    """Najde velké agresivní směrové opční bloky pro jeden ticker (sync, do to_thread)."""
+    try:
+        tk = yf.Ticker(ticker)
+        hist = tk.history(period="1d")
+        if hist.empty:
+            return []
+        spot = float(hist["Close"].iloc[-1])
+    except Exception:
+        return []
+
+    hits, _ = analyze_options_flow(ticker, spot)
+    out = []
+    for h in hits:
+        if h["premium"] < WHALE_MIN_PREMIUM:
+            continue
+        aggr = aggression_score(h["last"], h["bid"], h["ask"])
+        if aggr < WHALE_MIN_AGGR:
+            continue
+        bull = h["bscore_sum"] >= 1
+        bear = h["bscore_sum"] <= -1
+        if not (bull or bear):
+            continue  # jen jasné směrové sázky, ne neutrál
+        out.append({
+            "ticker": ticker, "opt_type": h["opt_type"], "strike": h["strike"],
+            "exp": h["exp"], "dte": h["dte"], "premium": h["premium"], "iv": h["iv"],
+            "volume": h["volume"], "oi": h["oi"], "ratio": h["ratio"],
+            "aggr": aggr, "bullish": bull, "spot": spot,
+            "key": f"{ticker}|{h['opt_type']}|{h['strike']}|{h['exp']}",
+        })
+    return out
+
+
+def format_whale_alert(a: dict) -> str:
+    side = "CALLS" if a["opt_type"] == "call" else "PUTS"
+    direction = "📈 Bullish sázka" if a["bullish"] else "📉 Bearish sázka"
+    aggr_lbl = "na asku (agresivní)" if a["aggr"] >= 0.85 else "blízko asku"
+    head = "🐳 *MEGA WHALE*" if a["premium"] >= 5_000_000 else "🐋 *WHALE ALERT*"
+    return (
+        f"{head}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"*{a['ticker']}* — `{fmt_usd(a['premium'])}` {side} {aggr_lbl}\n"
+        f"🎯 Strike `${a['strike']:.2f}` | exp {a['exp']} (`{a['dte']}` DTE)\n"
+        f"📊 Vol `{a['volume']:,}` / OI `{a['oi']:,}` (`{a['ratio']}×`) | IV {a['iv']}%\n"
+        f"💵 Spot `${a['spot']:.2f}` | {direction}"
+    )
+
+
+async def whale_radar_loop(context: ContextTypes.DEFAULT_TYPE):
+    """Proaktivní skener celého trhu na velké opční bloky. Rotuje po dávkách."""
+    global _whale_scan_idx
+    if not whale_radar_chats:
+        return
+    if us_market_session() == "closed":
+        return  # mimo US tržní hodiny se opce neobchodují
+
+    universe = WHALE_UNIVERSE
+    if not universe:
+        return
+    start = _whale_scan_idx % len(universe)
+    chunk = universe[start:start + WHALE_CHUNK]
+    if len(chunk) < WHALE_CHUNK:                       # wrap-around na konci seznamu
+        chunk += universe[:WHALE_CHUNK - len(chunk)]
+    _whale_scan_idx = (start + WHALE_CHUNK) % len(universe)
+
+    sem = asyncio.Semaphore(3)
+
+    async def scan(tk: str):
+        async with sem:
+            await asyncio.sleep(0.4)                   # šetrné k yfinance rate-limitu
+            try:
+                return await asyncio.to_thread(scan_ticker_whales, tk)
+            except Exception as e:
+                log.debug("[WHALE] %s chyba: %s", tk, e)
+                return []
+
+    results = await asyncio.gather(*[scan(t) for t in chunk])
+    alerts = [a for sub in results for a in sub]
+    fresh = [a for a in alerts if _whale_dedup_ok(a["key"])]
+    if not fresh:
+        return
+
+    fresh.sort(key=lambda a: a["premium"], reverse=True)
+    for a in fresh[:WHALE_MAX_ALERTS]:
+        msg = format_whale_alert(a)
+        for chat_id in list(whale_radar_chats):
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+            except Exception as e:
+                log.error("[WHALE] odeslání selhalo (chat %s): %s", chat_id, e)
+
+
 # ==============================================================================
 # 4. TELEGRAM HANDLERY
 # ==============================================================================
@@ -1166,6 +1316,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• `/nasdaq` – TOP 10 setupů z NASDAQ-100\n"
         "• `/darkhorse` – skryté příležitosti z Russell 2000\n"
         "• `/whales` – ranní whale-flow skener\n"
+        "• `/whaleradar on` – 🐋 živý radar velkých opčních bloků (celý trh)\n"
         "• `/unusual AAPL` – neobvyklá opční aktivita\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "*🤖 AI & fundament*\n"
@@ -2054,13 +2205,8 @@ async def unusual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception: await msg.edit_text(text)
 
 async def whales_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    watchlist = [
-        "ASTS", "RKLB", "LUNR", "ONDS", "SOUN", "IONQ", "RGTI", "QBTS", 
-        "ACHR", "JOBY", "LPTH", "UMAC", "AMPX", "KOPN", "SPAI", "LTRX", 
-        "SRFM", "DPRO", "CEG", "NOK", "AAOI", "DDD", "BBAI", "RDW", 
-        "SATL", "HOOD", "OKLO"
-    ]
-    
+    watchlist = WHALE_SMALLCAPS
+
     msg = await update.message.reply_text(
         f"⏳ Spouštím ranní skener pro Whale Tracker ({len(watchlist)} tickerů)...", 
         parse_mode="Markdown"
@@ -2120,6 +2266,33 @@ async def whales_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try: await msg.edit_text("\n".join(lines), parse_mode="Markdown")
     except Exception: await msg.edit_text("\n".join(lines).replace("*", "").replace("_", "").replace("`", ""))
+
+async def whaleradar_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Zapne/vypne proaktivní Whale Radar pro tento chat."""
+    chat_id = update.effective_chat.id
+    arg = ctx.args[0].lower() if ctx.args else "status"
+
+    if arg == "on":
+        whale_radar_chats.add(chat_id)
+        save_whale_chats()
+        await update.message.reply_text(
+            f"🐋 *WHALE RADAR ZAPNUT*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Skenuji `{len(WHALE_UNIVERSE)}` tickerů na velké agresivní opční bloky "
+            f"(≥ `{fmt_usd(WHALE_MIN_PREMIUM)}` prémium, na/u asku).\n"
+            f"Pingnu tě, jakmile někdo vsadí velké peníze. 🐳\n"
+            f"_Vypnutí:_ `/whaleradar off`",
+            parse_mode="Markdown")
+    elif arg == "off":
+        whale_radar_chats.discard(chat_id)
+        save_whale_chats()
+        await update.message.reply_text("🔕 *Whale Radar vypnut.*", parse_mode="Markdown")
+    else:
+        stav = "🟢 ZAPNUTÝ" if chat_id in whale_radar_chats else "🔴 VYPNUTÝ"
+        await update.message.reply_text(
+            f"🐋 *Whale Radar:* {stav}\n"
+            f"Použij `/whaleradar on` nebo `/whaleradar off`.",
+            parse_mode="Markdown")
 
 async def earnings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
@@ -2285,10 +2458,15 @@ def main():
         return
 
     # Obnov aktivní snipery z minulého běhu
-    global active_snipers
+    global active_snipers, whale_radar_chats
     active_snipers = load_snipers()
     if active_snipers:
         log.info("Obnoveno %d chatů s aktivními snipery.", len(active_snipers))
+
+    # Obnov odběratele Whale Radaru
+    whale_radar_chats = load_whale_chats()
+    if whale_radar_chats:
+        log.info("Obnoveno %d chatů s aktivním Whale Radarem.", len(whale_radar_chats))
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -2305,6 +2483,7 @@ def main():
     app.add_handler(CommandHandler("sniper", sniper_cmd))
     app.add_handler(CommandHandler("darkhorse", darkhorse_cmd))
     app.add_handler(CommandHandler("whales", whales_cmd))
+    app.add_handler(CommandHandler("whaleradar", whaleradar_cmd))
     app.add_handler(CommandHandler("ai", ai_pdf_cmd))
     app.add_handler(MessageHandler(filters.Document.PDF & filters.CaptionRegex(r'^/ai'), ai_pdf_cmd))
 
@@ -2316,6 +2495,7 @@ def main():
     # Naplánuj SMC Sniper skener na pozadí (každou minutu), pokud je JobQueue dostupná
     if app.job_queue:
         app.job_queue.run_repeating(sniper_background_task, interval=60, first=15, name="sniper_job")
+        app.job_queue.run_repeating(whale_radar_loop, interval=WHALE_RADAR_INTERVAL, first=30, name="whale_radar_job")
     else:
         log.warning("JobQueue není dostupná – SMC Sniper poběží jen po /sniper. Nainstaluj python-telegram-bot[job-queue].")
 
