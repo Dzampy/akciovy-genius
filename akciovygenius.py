@@ -3,6 +3,7 @@ import math
 import asyncio
 import time
 import json
+import hashlib
 import logging
 from datetime import datetime, timezone
 import os
@@ -52,6 +53,106 @@ if client is None:
     log.warning("GROQ_API_KEY chybí — AI funkce (news, walter, /ai) budou vypnuté.")
 
 active_snipers = {}
+
+
+# ── Walter (makro feed) konfigurace ───────────────────────────────────────────
+# Vše laditelné přes .env bez zásahu do kódu.
+WALTER_INTERVAL = int(os.getenv("WALTER_INTERVAL", "35"))            # interval kontroly feedu (s)
+WALTER_VOL_SPIKE = float(os.getenv("WALTER_VOL_SPIKE", "3.0"))       # kolikanásobek průměru = spike
+WALTER_ATR_MULT = float(os.getenv("WALTER_ATR_MULT", "1.5"))         # násobek ATR pro stop-loss
+WALTER_DEFAULT_TICKER = os.getenv("WALTER_DEFAULT_TICKER", "NVDA")   # proxy pro měření objemu u makra
+WALTER_COOLDOWN_MIN = int(os.getenv("WALTER_COOLDOWN_MIN", "10"))    # min. odstup alertů na stejný ticker (min)
+FIXED_RISK_PCT_FALLBACK = float(os.getenv("WALTER_FIXED_RISK_PCT", "0.008"))  # když ATR chybí
+WALTER_DEDUP_HISTORY = int(os.getenv("WALTER_DEDUP_HISTORY", "30"))  # kolik posledních zpráv pamatovat
+
+# Runtime stav pro Walter (rate-limiting alertů na ticker)
+_walter_last_alert = {}            # {ticker: timestamp posledního alertu}
+_WALTER_SEEN_FILE = "walter_seen.json"
+_walter_seen_hashes = []           # rolling historie hashů zpráv (perzistovaná)
+_walter_seen_loaded = False
+
+
+def us_market_session():
+    """Vrátí 'regular' | 'pre' | 'after' | 'closed' podle času v US/Eastern."""
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        now_et = datetime.now(timezone.utc)  # nouzový fallback (přibližně)
+    if now_et.weekday() >= 5:
+        return "closed"
+    t = now_et.hour * 60 + now_et.minute
+    if 4 * 60 <= t < 9 * 60 + 30:
+        return "pre"
+    if 9 * 60 + 30 <= t < 16 * 60:
+        return "regular"
+    if 16 * 60 <= t < 20 * 60:
+        return "after"
+    return "closed"
+
+
+def compute_atr(df, period: int = 14):
+    """ATR z DataFrame s High/Low/Close. Vrátí None při nedostatku dat."""
+    try:
+        high = df["High"].astype(float)
+        low = df["Low"].astype(float)
+        close = df["Close"].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+            axis=1,
+        ).max(axis=1)
+        atr = tr.tail(period).mean()
+        return float(atr) if (atr == atr and atr > 0) else None  # atr==atr odfiltruje NaN
+    except Exception:
+        return None
+
+
+def _walter_cooldown_ok(ticker: str) -> bool:
+    """True, pokud na daný ticker uplynul cooldown od posledního alertu."""
+    last = _walter_last_alert.get(ticker)
+    return last is None or (time.time() - last) >= WALTER_COOLDOWN_MIN * 60
+
+
+def _walter_mark_alert(ticker: str):
+    _walter_last_alert[ticker] = time.time()
+
+
+def _walter_seen_check_and_remember(text: str) -> bool:
+    """Vrátí True, pokud už jsme tuto zprávu viděli (dedup přes rolling hash
+    historii perzistovanou na disk → odolné i vůči restartu bota)."""
+    global _walter_seen_hashes, _walter_seen_loaded
+    if not _walter_seen_loaded:
+        try:
+            if os.path.exists(_WALTER_SEEN_FILE):
+                with open(_WALTER_SEEN_FILE, "r", encoding="utf-8") as f:
+                    _walter_seen_hashes = json.load(f)
+        except Exception:
+            _walter_seen_hashes = []
+        _walter_seen_loaded = True
+
+    h = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    if h in _walter_seen_hashes:
+        return True
+
+    _walter_seen_hashes.append(h)
+    del _walter_seen_hashes[:-WALTER_DEDUP_HISTORY]  # ořež na posledních N
+    try:
+        with open(_WALTER_SEEN_FILE, "w", encoding="utf-8") as f:
+            json.dump(_walter_seen_hashes, f)
+    except Exception:
+        pass
+    return False
+
+
+def _walter_confidence(vol_mult: float):
+    """Jednoduché confidence skóre z poměru objemu vůči prahu spiku."""
+    ratio = vol_mult / WALTER_VOL_SPIKE if WALTER_VOL_SPIKE > 0 else 0
+    if ratio >= 2.0:
+        return "🟢 Vysoká"
+    if ratio >= 1.3:
+        return "🟡 Střední"
+    return "🔴 Nízká"
 
 
 # ── Helper: volání Groq s pojistkou proti chybějícímu klíči ───────────────────
@@ -1311,11 +1412,13 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
         
         resp = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
         if resp.status_code != 200:
+            log.warning("[WALTER] Feed vrátil HTTP %s — přeskakuji tento cyklus.", resp.status_code)
             return
-            
+
         soup = BeautifulSoup(resp.text, 'html.parser')
         zpravy = soup.find_all('div', class_='tgme_widget_message_text')
         if not zpravy:
+            log.warning("[WALTER] Feed neobsahuje žádné zprávy (změna struktury stránky?).")
             return
             
         text_tweetu = zpravy[-1].get_text(separator=" ", strip=True)
@@ -1326,16 +1429,17 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
             with open(pamet_soubor, "r", encoding="utf-8") as f:
                 last_market_text = f.read().strip()
                 
-        # 3. KONTROLA DUPLICITY
-        if text_tweetu == last_market_text:
-            # Je to stará zpráva, nic neděláme
+        # 3. KONTROLA DUPLICITY — rychlá (poslední zpráva) + rolling hash historie
+        #    (odolná i vůči restartu a drobně přeposlaným/opakovaným titulkům)
+        if text_tweetu == last_market_text or _walter_seen_check_and_remember(text_tweetu):
+            # Je to stará/už zpracovaná zpráva, nic neděláme
             return
-            
+
         # 4. JE TO NOVÉ! Uložíme do paměti a jdeme pracovat
         log.info("[WALTER] Nová zpráva: %s...", text_tweetu[:50])
         with open(pamet_soubor, "w", encoding="utf-8") as f:
             f.write(text_tweetu)
-            
+
         last_market_text = text_tweetu
 
         # ... (zde pokračuje tvůj stávající kód: # --- FÁZE 1: AI DETEKCE TICKERU...)
@@ -1362,8 +1466,7 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
         if ai_raw is None:
             return
         ai_text = ai_raw.replace("```json", "").replace("```", "").strip()
-        
-        import json
+
         try:
             analyza = json.loads(ai_text)
         except Exception:
@@ -1374,58 +1477,53 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
             log.info("Walter zahodil irelevantní zprávu: %s", text_tweetu)
             return
             
-        # --- FÁZE 2: UNIVERZÁLNÍ VOLUME SPIKE ---
-        from datetime import datetime
-        
+        # --- FÁZE 2: VOLUME SPIKE + ATR STOP ---
         target_ticker = analyza.get("ticker")
+        typ = analyza.get("typ")
         is_weekend = datetime.now().weekday() >= 5
-        
+        session = us_market_session()
+
         if is_weekend:
+            # O víkendu obchoduje jen krypto → BTC jako proxy/aktivum.
             target_ticker = "BTC-USD"
-            is_macro = True 
+            is_macro = True
+        elif not target_ticker or str(target_ticker).lower() in ("none", "null"):
+            # Nemáme konkrétní ticker → bereme to čistě jako makro a NVDA je jen teploměr objemu.
+            target_ticker = WALTER_DEFAULT_TICKER
+            is_macro = True
         else:
-            if not target_ticker or str(target_ticker).lower() == "none" or str(target_ticker).lower() == "null":
-                target_ticker = "NVDA"
-            else:
-                target_ticker = target_ticker.upper()
-            is_macro = analyza.get("typ") == "makro"
-            
+            target_ticker = target_ticker.upper()
+            is_macro = (typ == "makro")
+
         sentiment = analyza.get("sentiment", "neutral").lower()
-        
+        is_btc = (target_ticker == "BTC-USD")
+        # Mimo obchodní hodiny jsou akciová data stará → entry/stop nedává smysl.
+        equity_tradable = is_btc or (session in ("regular", "pre", "after"))
+
         aktualni_cena = 0.0
         aktualni_vol = 0.0
         prumer_vol_10m = 0.0
-        stop_loss = 0.0
-        smer = ""
+        atr = None
         ma_data = False
-        
-        # Pevný risk pro volatilitu (0.8 %) místo hloupého 5min low
-        FIXED_RISK_PCT = 0.008 
 
-        if target_ticker == "BTC-USD":
+        if is_btc:
             try:
-                url_binance = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=11"
+                url_binance = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=20"
                 resp_binance = await asyncio.to_thread(requests.get, url_binance, timeout=5)
                 if resp_binance.status_code == 200:
                     k_data = resp_binance.json()
-                    closes = [float(k[4]) for k in k_data]
-                    volumes = [float(k[5]) for k in k_data]
-                    
-                    if len(volumes) == 11:
-                        aktualni_cena = closes[-1]
-                        aktualni_vol = volumes[-1]
-                        prumer_vol_10m = sum(volumes[:-1]) / 10
-                        
-                        if sentiment == "bullish":
-                            stop_loss = aktualni_cena * (1 - FIXED_RISK_PCT)
-                            smer = "LONG 🟢"
-                        else:
-                            stop_loss = aktualni_cena * (1 + FIXED_RISK_PCT)
-                            smer = "SHORT 🔴"
+                    if len(k_data) >= 11:
+                        df_btc = pd.DataFrame(k_data).iloc[:, 1:6]
+                        df_btc.columns = ["Open", "High", "Low", "Close", "Volume"]
+                        df_btc = df_btc.astype(float)
+                        aktualni_cena = float(df_btc["Close"].iloc[-1])
+                        aktualni_vol = float(df_btc["Volume"].iloc[-1])
+                        prumer_vol_10m = float(df_btc["Volume"].iloc[-11:-1].mean())
+                        atr = compute_atr(df_btc)
                         ma_data = True
             except Exception as e:
                 log.error("Chyba Binance API: %s", e)
-                
+
         else:
             data_1m = await asyncio.to_thread(yf.download, target_ticker, period="1d", interval="1m", progress=False)
             if not data_1m.empty and len(data_1m) > 10:
@@ -1434,70 +1532,86 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
                         data_1m.columns = data_1m.columns.get_level_values(0)
                     else:
                         data_1m.columns = data_1m.columns.get_level_values(-1)
-                        
+
                 data_1m.columns = [str(c).strip() for c in data_1m.columns]
-                
+
                 if 'Close' in data_1m.columns and 'Volume' in data_1m.columns:
                     aktualni_cena = float(data_1m['Close'].iloc[-1])
                     aktualni_vol = float(data_1m['Volume'].iloc[-1])
                     prumer_vol_10m = float(data_1m['Volume'].tail(11).head(10).mean())
-                    
-                    if sentiment == "bullish":
-                        stop_loss = aktualni_cena * (1 - FIXED_RISK_PCT)
-                        smer = "LONG 🟢"
-                    else:
-                        stop_loss = aktualni_cena * (1 + FIXED_RISK_PCT)
-                        smer = "SHORT 🔴"
+                    atr = compute_atr(data_1m)
                     ma_data = True
 
-        if ma_data and prumer_vol_10m > 0 and (aktualni_vol > prumer_vol_10m * 3) and sentiment in ["bullish", "bearish"]:
+        # Směr + stop z ATR (s fallbackem na pevné % když ATR chybí).
+        smer = ""
+        stop_loss = 0.0
+        if ma_data and aktualni_cena > 0:
+            risk_abs = (WALTER_ATR_MULT * atr) if (atr and atr > 0) else (aktualni_cena * FIXED_RISK_PCT_FALLBACK)
+            if sentiment == "bullish":
+                smer = "LONG 🟢"
+                stop_loss = aktualni_cena - risk_abs
+            elif sentiment == "bearish":
+                smer = "SHORT 🔴"
+                stop_loss = aktualni_cena + risk_abs
+
+        spike = ma_data and prumer_vol_10m > 0 and (aktualni_vol > prumer_vol_10m * WALTER_VOL_SPIKE)
+
+        # NEWS ENTRY jen pro konkrétní akcii/krypto (NE makro proxy), v obchodních
+        # hodinách, při objemovém spiku, jasném sentimentu a po vychladnutí cooldownu.
+        if (not is_macro) and equity_tradable and spike and smer and _walter_cooldown_ok(target_ticker):
             risk_display = abs(aktualni_cena - stop_loss) / aktualni_cena * 100
-            
+            stop_basis = f"{WALTER_ATR_MULT:g}×ATR" if (atr and atr > 0) else f"{FIXED_RISK_PCT_FALLBACK*100:g}% fallback"
+            vol_mult = aktualni_vol / prumer_vol_10m
+            confidence = _walter_confidence(vol_mult)
+
             zprava = f"⚡ *NEWS ENTRY DETECTED: {target_ticker}*\n"
             zprava += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            if is_macro:
-                zprava += f"🌍 *Makro Proxy ({target_ticker}):* _{analyza['duvod']}_\n"
-            else:
-                zprava += f"📰 *Katalyzátor:* _{analyza['duvod']}_\n"
-                
-            if target_ticker == "BTC-USD":
+            zprava += f"📰 *Katalyzátor:* _{analyza.get('duvod', '')}_\n"
+            zprava += f"📈 *Síla signálu:* {confidence} ({vol_mult:.1f}x objem)\n"
+            if is_btc:
                 zprava += f"📊 *1m Volume Spike:* `{aktualni_vol:,.2f} BTC` ({aktualni_vol/prumer_vol_10m:.1f}x normál)\n\n"
             else:
-                zprava += f"📊 *1m Volume Spike:* `{aktualni_vol:,.0f}` ({aktualni_vol/prumer_vol_10m:.1f}x normál)\n\n"
-                
+                zprava += f"📊 *1m Volume Spike:* `{aktualni_vol:,.0f}` ({aktualni_vol/prumer_vol_10m:.1f}x normál)\n"
+                if session != "regular":
+                    zprava += f"🕒 _Seance: {session.upper()} (mimo hlavní hodiny)_\n"
+                zprava += "\n"
             zprava += f"🎯 *Akce:* `{smer}`\n"
             zprava += f"💵 *Vstup:* `${aktualni_cena:.2f}`\n"
-            zprava += f"🛑 *Stop:* `${stop_loss:.2f}` (Risk {risk_display:.2f}%)\n"
+            zprava += f"🛑 *Stop:* `${stop_loss:.2f}` (Risk {risk_display:.2f}% · {stop_basis})\n"
             zprava += f"⚠️ *Sizing:* `Max 0.5% portfolia!`"
-            
+
             await context.bot.send_message(chat_id=context.job.chat_id, text=zprava, parse_mode="Markdown")
-            return 
-                
-        # --- FÁZE 3: FALLBACK NA KLASICKÉ MAKRO PŘES GROQ ---
+            _walter_mark_alert(target_ticker)
+            return
+
+        # --- FÁZE 3: MAKRO ALERT (bez konkrétního entry/stop) ---
         prompt_makro = f"""
         Jsi institucionální quant analytik. Zde je nejnovější blesková zpráva z trhu:
         "{text_tweetu}"
-        
+
         Tato zpráva není o jedné firmě, ale o makroekonomickém dění.
         Vygeneruj PŘESNĚ tento výstup pro tradera:
-        
+
         🌍 *Překlad:* [Český přesný překlad]
         📉 *Impact Nasdaq:* [např. -0.8% nebo +1.2%] ([stručný důvod])
         🤖 *AI Analýza:* [1 úderná věta makro-kontextu]
         """
-        
+
         makro_text = await ask_groq(prompt_makro, temperature=0.2)
         if makro_text is None:
             return
-        
+
         vol_info = ""
         if ma_data and prumer_vol_10m > 0:
             nasobek = aktualni_vol / prumer_vol_10m
-            if target_ticker == "BTC-USD":
-                vol_info = f"\n\n📊 *Sledovaný objem ({target_ticker}):* `{aktualni_vol:,.2f} BTC` ({nasobek:.1f}x normál)"
+            teplomer = "🔥 zvýšený" if nasobek >= WALTER_VOL_SPIKE else "klidný"
+            if is_btc:
+                vol_info = f"\n\n📊 *Objem ({target_ticker}, {teplomer}):* `{aktualni_vol:,.2f} BTC` ({nasobek:.1f}x normál)"
             else:
-                vol_info = f"\n\n📊 *Sledovaný objem ({target_ticker}):* `{aktualni_vol:,.0f}` ({nasobek:.1f}x normál)"
-            
+                vol_info = f"\n\n📊 *Objem ({target_ticker}, {teplomer}):* `{aktualni_vol:,.0f}` ({nasobek:.1f}x normál)"
+        elif not is_btc and session == "closed":
+            vol_info = "\n\n🕒 _US burza je zavřená — objem se nesleduje._"
+
         zprava_makro = f"🚨 *MARKET MACRO ALERT*\n━━━━━━━━━━━━━━━━━━━━━━\n{makro_text}{vol_info}"
         
         await context.bot.send_message(chat_id=context.job.chat_id, text=zprava_makro, parse_mode="Markdown")
@@ -1522,10 +1636,10 @@ async def cmd_walter(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
             
         context.job_queue.run_repeating(
-            walter_macro_loop, 
-            interval=35, 
-            first=1, 
-            chat_id=chat_id, 
+            walter_macro_loop,
+            interval=WALTER_INTERVAL,
+            first=1,
+            chat_id=chat_id,
             name="walter_job"
         )
         await update.message.reply_text("🚨 *AUTOMATICKÉ SLEDOVÁNÍ ZAPNUTO*", parse_mode="Markdown")

@@ -12,6 +12,8 @@ venv/
 # Logy a runtime stav
 bot.log
 active_snipers.json
+walter_seen.json
+posledni_tweet.txt
 
 # Cache / databáze
 *.sqlite
