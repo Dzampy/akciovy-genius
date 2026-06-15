@@ -57,7 +57,6 @@ if client is None:
 
 active_snipers = {}
 
-
 # ── Walter (makro feed) konfigurace ───────────────────────────────────────────
 # Vše laditelné přes .env bez zásahu do kódu.
 WALTER_INTERVAL = int(os.getenv("WALTER_INTERVAL", "35"))            # interval kontroly feedu (s)
@@ -132,7 +131,6 @@ _WALTER_SEEN_FILE = "walter_seen.json"
 _walter_seen_hashes = []           # rolling historie hashů zpráv (perzistovaná)
 _walter_seen_loaded = False
 
-
 def us_market_session():
     """Vrátí 'regular' | 'pre' | 'after' | 'closed' podle času v US/Eastern."""
     try:
@@ -151,7 +149,6 @@ def us_market_session():
         return "after"
     return "closed"
 
-
 def compute_atr(df, period: int = 14):
     """ATR z DataFrame s High/Low/Close. Vrátí None při nedostatku dat."""
     try:
@@ -168,16 +165,13 @@ def compute_atr(df, period: int = 14):
     except Exception:
         return None
 
-
 def _walter_cooldown_ok(ticker: str) -> bool:
     """True, pokud na daný ticker uplynul cooldown od posledního alertu."""
     last = _walter_last_alert.get(ticker)
     return last is None or (time.time() - last) >= WALTER_COOLDOWN_MIN * 60
 
-
 def _walter_mark_alert(ticker: str):
     _walter_last_alert[ticker] = time.time()
-
 
 def _walter_seen_check_and_remember(text: str) -> bool:
     """Vrátí True, pokud už jsme tuto zprávu viděli (dedup přes rolling hash
@@ -205,7 +199,6 @@ def _walter_seen_check_and_remember(text: str) -> bool:
         pass
     return False
 
-
 def _walter_confidence(vol_mult: float):
     """Jednoduché confidence skóre z poměru objemu vůči prahu spiku."""
     ratio = vol_mult / WALTER_VOL_SPIKE if WALTER_VOL_SPIKE > 0 else 0
@@ -214,7 +207,6 @@ def _walter_confidence(vol_mult: float):
     if ratio >= 1.3:
         return "🟡 Střední"
     return "🔴 Nízká"
-
 
 # ── Helper: volání Groq s pojistkou proti chybějícímu klíči ───────────────────
 async def ask_groq(prompt: str, temperature: float = 0.2,
@@ -231,7 +223,6 @@ async def ask_groq(prompt: str, temperature: float = 0.2,
         temperature=temperature,
     )
     return resp.choices[0].message.content
-
 
 # ── Jednoduchá TTL cache pro yfinance stahování ───────────────────────────────
 _YF_CACHE: dict = {}
@@ -266,7 +257,6 @@ def cached_yf_download(ticker: str, period: str, interval: str, ttl: int = 300):
     _YF_CACHE[key] = (now, df.copy())
     return df
 
-
 # ── Persistence aktivních sniperů (přežije restart bota) ──────────────────────
 SNIPERS_FILE = "active_snipers.json"
 
@@ -290,7 +280,6 @@ def save_snipers() -> None:
     except Exception as e:
         log.error("Nepodařilo se uložit snipery: %s", e)
 
-
 # ── Telegram helpery (limity délky zpráv) ─────────────────────────────────────
 TG_CAPTION_LIMIT = 1024   # max délka popisku fotky
 TG_MSG_LIMIT = 4096       # max délka textové zprávy
@@ -308,7 +297,6 @@ async def safe_send(bot, chat_id: str, text: str) -> None:
             )
         except Exception as e:
             log.error("safe_send selhal i jako plain text (chat %s): %s", chat_id, e)
-
 
 async def scan_universe(tickers, worker, *, concurrency=SCAN_CONCURRENCY, delay=1.0):
     """Sjednocený paralelní sken seznamu tickerů.
@@ -333,7 +321,6 @@ async def scan_universe(tickers, worker, *, concurrency=SCAN_CONCURRENCY, delay=
                 return None
 
     return await asyncio.gather(*[run(tk) for tk in tickers])
-
 
 async def reply_long(message, text: str, parse_mode: str = "Markdown") -> None:
     """Pošle text rozdělený na kusy do 4096 znaků. Když selže Markdown, zkusí plain text."""
@@ -543,7 +530,6 @@ def _compute_indicators(df) -> dict:
         "nearest_res": nearest_res,
     }
 
-
 def classify_setup(ind: dict, flow_score_val: float = 0.0) -> dict:
     """Z indikátorů (+ volitelně options flow) určí typ setupu, vstupní zónu,
     stop, targety, skóre a status. Čistá funkce → identická živě i v backtestu."""
@@ -695,7 +681,6 @@ def classify_setup(ind: dict, flow_score_val: float = 0.0) -> dict:
         "summary": summary, "status": status, "pullback_risk": pullback_risk,
         "dist_to_zone_pct": dist_to_zone_pct,
     }
-
 
 def make_chart(ticker: str, interval: str = "1d", render: bool = True, flow: bool = True):
     if interval in ["1h", "4h"]:
@@ -858,10 +843,6 @@ def make_sr_chart(ticker: str, interval: str):
     ]
 
     return None, "\n".join(lines)
-
-def analyze_setup(ticker: str):
-    _, text, _ = make_chart(ticker, "1d")
-    return text
 
 # ==============================================================================
 # 3. EARNINGS A OPCE
@@ -1119,7 +1100,6 @@ def _et_today() -> str:
     except Exception:
         return datetime.now(timezone.utc).date().isoformat()
 
-
 def load_flow_history() -> None:
     """Líně načte flow paměť z disku (jednou). Po načtení rovnou prořeže."""
     global _flow_history, _flow_loaded
@@ -1136,7 +1116,6 @@ def load_flow_history() -> None:
         _flow_loaded = True
     _prune_flow_history()
 
-
 def save_flow_history() -> None:
     """Atomicky uloží paměť na disk — jen když je co (dirty). Bezpečné z více vláken."""
     global _flow_dirty
@@ -1152,7 +1131,6 @@ def save_flow_history() -> None:
         os.replace(tmp, FLOW_HISTORY_FILE)   # atomická výměna → nikdy půlka souboru
     except Exception as e:
         log.error("Nepodařilo se uložit flow paměť: %s", e)
-
 
 def _prune_flow_history() -> None:
     """Vyhodí expirované strikes, staré denní záznamy a přebytek nad strop."""
@@ -1174,7 +1152,6 @@ def _prune_flow_history() -> None:
             ordered = sorted(_flow_history.items(),
                              key=lambda kv: kv[1].get("last_seen", ""), reverse=True)
             _flow_history = dict(ordered[:FLOW_HISTORY_MAX_KEYS])
-
 
 def record_flow_snapshot(ticker: str, hits: list[dict]) -> None:
     """Zapíše dnešní stav každého bloku do paměti (1 záznam/strike/den, jen do RAM).
@@ -1212,7 +1189,6 @@ def record_flow_snapshot(ticker: str, hits: list[dict]) -> None:
                 rec["last_seen"] = today
             _flow_dirty = True
 
-
 def _accum_from_history(hist: list[dict]) -> dict | None:
     """Z denní historie strike spočítá trend: label + růst OI/prémie + počet dní."""
     if not hist:
@@ -1239,7 +1215,6 @@ def _accum_from_history(hist: list[dict]) -> dict | None:
         "is_accum": label == "🟢 Akumulace",
     }
 
-
 def flow_accumulation(ticker: str, opt_type: str, strike: float, exp: str) -> dict | None:
     """Trend pro konkrétní strike z paměti. None = žádná historie."""
     key = f"{ticker}|{opt_type}|{strike}|{exp}"
@@ -1247,7 +1222,6 @@ def flow_accumulation(ticker: str, opt_type: str, strike: float, exp: str) -> di
         rec = _flow_history.get(key)
         hist = list(rec["history"]) if rec else []
     return _accum_from_history(hist)
-
 
 def analyze_options_flow(ticker: str, spot: float) -> tuple[list[dict], float]:
     if spot <= 0: return [], 0.0
@@ -1485,7 +1459,6 @@ async def get_net_whale_flow(ticker: str) -> dict:
     except Exception:
         return None
 
-
 # ── Whale Radar: perzistence odběrů, dedup, skener, formát ────────────────────
 def load_whale_chats() -> set:
     """Načte odběratele Whale Radaru z disku (přežije restart)."""
@@ -1498,14 +1471,12 @@ def load_whale_chats() -> set:
         log.error("Chyba při načítání whale radaru: %s", e)
         return set()
 
-
 def save_whale_chats() -> None:
     try:
         with open(_WHALE_RADAR_FILE, "w", encoding="utf-8") as f:
             json.dump(sorted(whale_radar_chats), f)
     except Exception as e:
         log.error("Nepodařilo se uložit whale radar: %s", e)
-
 
 def _whale_dedup_ok(key: str) -> bool:
     """True, pokud tento blok dnes ještě nebyl odeslán. Paměť se resetuje denně."""
@@ -1517,7 +1488,6 @@ def _whale_dedup_ok(key: str) -> bool:
         return False
     _whale_seen[key] = today
     return True
-
 
 def scan_ticker_whales(ticker: str) -> list[dict]:
     """Najde velké agresivní směrové opční bloky pro jeden ticker (sync, do to_thread)."""
@@ -1554,7 +1524,6 @@ def scan_ticker_whales(ticker: str) -> list[dict]:
         })
     return out
 
-
 def format_whale_alert(a: dict) -> str:
     side = "CALLS" if a["opt_type"] == "call" else "PUTS"
     direction = "📈 Bullish sázka" if a["bullish"] else "📉 Bearish sázka"
@@ -1580,7 +1549,6 @@ def format_whale_alert(a: dict) -> str:
         f"💵 Spot `${a['spot']:.2f}` | {direction}"
         f"{accum_line}"
     )
-
 
 async def whale_radar_loop(context: ContextTypes.DEFAULT_TYPE):
     """Proaktivní skener celého trhu na velké opční bloky. Rotuje po dávkách."""
@@ -1614,13 +1582,11 @@ async def whale_radar_loop(context: ContextTypes.DEFAULT_TYPE):
         for chat_id in list(whale_radar_chats):
             await safe_send(context.bot, chat_id, msg)
 
-
 async def flow_history_flush_job(context: ContextTypes.DEFAULT_TYPE):
     """Pravidelně prořeže a uloží flow paměť (i když radar zrovna neběží).
     Oba kroky jsou no-op, když není co dělat → levné."""
     await asyncio.to_thread(_prune_flow_history)
     await asyncio.to_thread(save_flow_history)
-
 
 # ==============================================================================
 # 3b. GENIUS SCORE — fúzní engine (technika + flow + news → 1 přesvědčení)
@@ -1739,7 +1705,6 @@ def genius_fuse(lenses: dict) -> dict:
         "tech": tech,
     }
 
-
 def _genius_thesis(r: dict) -> str:
     """Jednovětá teze v lidské řeči podle směru + jistoty."""
     d = r["direction"]
@@ -1754,7 +1719,6 @@ def _genius_thesis(r: dict) -> str:
     elif r["conflict"]:
         core += ", ale technika a flow si protiřečí"
     return core + "."
-
 
 def format_genius(r: dict) -> str:
     bar_n = int(round(r["score"] / 10))
@@ -1796,7 +1760,6 @@ def format_genius(r: dict) -> str:
     lines += ["━━━━━━━━━━━━━━━━━━━━━━", "_Fúze veřejných dat, ne investiční doporučení._"]
     return "\n".join(lines)
 
-
 async def get_news_sentiment(ticker: str) -> dict | None:
     """News lens přes Groq. None = nedostupné (chybí klíč / data / chyba)."""
     if client is None:
@@ -1821,7 +1784,6 @@ async def get_news_sentiment(ticker: str) -> dict | None:
         log.debug("[GENIUS] news lens %s chyba: %s", ticker, e)
         return None
 
-
 def _next_earnings_days(ticker: str):
     """Počet dní do nejbližších earnings (None = neznámé)."""
     try:
@@ -1842,10 +1804,8 @@ def _next_earnings_days(ticker: str):
     except Exception:
         return None
 
-
 async def _next_earnings_days_async(ticker: str):
     return await asyncio.to_thread(_next_earnings_days, ticker)
-
 
 async def gather_genius(ticker: str) -> dict:
     """Posbírá všechny pohledy paralelně a vrátí finální verdikt z genius_fuse."""
@@ -1895,7 +1855,6 @@ async def gather_genius(ticker: str) -> dict:
         "tech": tech, "flow": flow, "news": news, "earn_days": earn_days,
     })
 
-
 # ==============================================================================
 # 3c. EDGE LAB — historická validace setupů (backtest)
 # ==============================================================================
@@ -1910,7 +1869,6 @@ EDGE_MIN_SAMPLE = int(os.getenv("EDGE_MIN_SAMPLE", "10"))  # min. obchodů pro d
 EDGE_PULLBACK_WINDOW = int(os.getenv("EDGE_PULLBACK_WINDOW", "10"))  # dní čekání na vstup do zóny
 EDGE_MIN_RR = float(os.getenv("EDGE_MIN_RR", "1.5"))    # min. R:R zóny (stejný práh jako „VYHNOUT" živě)
 BULLISH_SETUPS = ("🟢 Pullback Buy", "🚀 ATH Breakout", "🚀 Momentum Breakout")
-
 
 def simulate_trade(entry: float, stop: float, target: float,
                    highs, lows, closes, max_hold: int) -> dict | None:
@@ -1935,7 +1893,6 @@ def simulate_trade(entry: float, stop: float, target: float,
     return {"outcome": "timeout", "ret": ret, "bars": n,
             "risk": risk, "r": ret / risk if risk > 0 else 0.0}
 
-
 def _aggregate_edge(trades: list[dict]) -> dict | None:
     """Z listu obchodů spočítá win-rate, Ø zisk/ztrátu, expectancy v R, profit factor."""
     if not trades:
@@ -1958,7 +1915,6 @@ def _aggregate_edge(trades: list[dict]) -> dict | None:
         "timeouts": sum(1 for t in trades if t["outcome"] == "timeout"),
         "avg_bars": sum(t["bars"] for t in trades) / n,
     }
-
 
 def backtest_setups(ticker: str, years: int = EDGE_DEFAULT_YEARS,
                     max_hold: int = EDGE_MAX_HOLD, min_score: int = 0) -> dict | None:
@@ -2053,7 +2009,6 @@ def backtest_setups(ticker: str, years: int = EDGE_DEFAULT_YEARS,
         "by_setup": by_setup, "overall": _aggregate_edge(trades),
     }
 
-
 def _edge_verdict(agg: dict) -> str:
     """Slovní verdikt nad expectancy + velikostí vzorku."""
     if agg["n"] < EDGE_MIN_SAMPLE:
@@ -2064,7 +2019,6 @@ def _edge_verdict(agg: dict) -> str:
         return "🟡 Slabý edge"
     return "🔴 Bez edge"
 
-
 def _fmt_edge_block(title: str, agg: dict) -> list[str]:
     pf = "∞" if agg["pf"] == float("inf") else f"{agg['pf']:.2f}"
     return [
@@ -2072,7 +2026,6 @@ def _fmt_edge_block(title: str, agg: dict) -> list[str]:
         f"  WR `{agg['wr']*100:.0f}%`  •  Exp `{agg['exp_r']:+.2f}R`  •  PF `{pf}`",
         f"  Ø zisk `{agg['avg_win']*100:+.1f}%`  •  Ø ztráta `{agg['avg_loss']*100:+.1f}%`  •  Ø {agg['avg_bars']:.0f} dní",
     ]
-
 
 def format_edge(report: dict) -> str:
     if report is None:
@@ -2109,7 +2062,6 @@ def format_edge(report: dict) -> str:
               "_Historická statistika, ne investiční doporučení._"]
     return "\n".join(lines)
 
-
 # ==============================================================================
 # 4. TELEGRAM HANDLERY
 # ==============================================================================
@@ -2134,7 +2086,6 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "*📊 Grafy & setupy*\n"
         "• `AAPL` nebo `RKLB 4h` – graf + S/R úrovně (TF: 1m,5m,15m,30m,1h,4h,1d,1wk,1mo)\n"
-        "• `/setup ASTS` – Confluence setup (entry zóna, stop, targety, R:R)\n"
         "• `/smc ASTS` – Smart Money Concepts (Order Blocks, FVG, sweepy)\n"
         "• `/sniper ASTS` – alert na zásah OB zóny (vypnutí: `/sniper off ASTS`)\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2154,7 +2105,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• `/news ONDS` – AI sentiment z nejnovějších zpráv\n"
         "• `/earnings ASTS` – hodnocení posledních výsledků\n"
         "• `/ai` (s PDF) – tvrdý výtah z prezentace/reportu\n"
-        "• `/walter`, `/testwalter` – makro market alerty",
+        "• `/walter` – makro market alerty",
         parse_mode="Markdown")
 
 last_market_text = ""
@@ -2503,7 +2454,6 @@ async def sniper_background_task(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 log.error("Sniper chyba u %s: %s", ticker, e)
 
-
 # Tuhle proměnnou musíme definovat ZVENKU před funkcí, aby se na ni mohl globálně odkazovat
 last_market_text = ""
 
@@ -2771,53 +2721,6 @@ async def cmd_walter(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         await update.message.reply_text("🔕 *AUTOMATICKÉ SLEDOVÁNÍ VYPNUTO*", parse_mode="Markdown")
 
-async def cmd_testwalter(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ *Zahajuji test:* Odesílám GET požadavek na zrcadlo MarketFeed...", parse_mode="Markdown")
-    
-    try:
-        url = "https://t.me/s/marketfeed"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
-        
-        resp = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
-        
-        if resp.status_code != 200:
-            await msg.edit_text(f"❌ *Chyba:* Zrcadlo neodpovídá (Status: {resp.status_code})")
-            return
-            
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        zpravy = soup.find_all('div', class_='tgme_widget_message_text')
-        
-        if not zpravy:
-            await msg.edit_text("❌ *Chyba:* Nepodařilo se najít žádné zprávy v HTML kódu.")
-            return
-            
-        text_tweetu = zpravy[-1].get_text(separator=" ", strip=True)
-        
-        await msg.edit_text(f"✅ *Poslední zpráva stažena (MarketFeed):*\n`{text_tweetu}`\n\n🧠 *Posílám do Groq AI na analýzu...*", parse_mode="Markdown")
-        
-        prompt = f"""
-        Jsi institucionální quant analytik. Zde je nejnovější blesková zpráva z trhu:
-        "{text_tweetu}"
-        
-        Tato zpráva není o jedné firmě, ale o makroekonomickém dění.
-        Vygeneruj PŘESNĚ tento výstup pro tradera:
-        
-        🌍 *Překlad:* [Český přesný překlad]
-        📉 *Impact Nasdaq:* [např. -0.8% nebo +1.2%] ([stručný důvod])
-        🤖 *AI Analýza:* [1 úderná věta makro-kontextu]
-        """
-        
-        ai_out = await ask_groq(prompt, temperature=0.2)
-        if ai_out is None:
-            await update.message.reply_text("⚠️ AI není nakonfigurovaná (chybí GROQ_API_KEY).")
-            return
-
-        zprava = f"🛠️ *TEST MARKET ALERT*\n━━━━━━━━━━━━━━━━━━━━━━\n{ai_out}"
-        await update.message.reply_text(zprava, parse_mode="Markdown")
-        
-    except Exception as e:
-        await update.message.reply_text(f"❌ *Kritická chyba:*\n`{str(e)}`", parse_mode="Markdown")
-
 async def news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("Použití: `/news AAPL`", parse_mode="Markdown")
@@ -3078,7 +2981,6 @@ async def whales_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: await msg.edit_text("\n".join(lines), parse_mode="Markdown")
     except Exception: await msg.edit_text("\n".join(lines).replace("*", "").replace("_", "").replace("`", ""))
 
-
 async def akumulace_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Co se právě nabaluje: strikes s vícedenní akumulací napříč pamětí enginu.
     Volitelně filtruj na ticker: `/akumulace PLTR`."""
@@ -3124,7 +3026,6 @@ async def akumulace_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("💡 _Vícedenní akumulace > jednorázový blok. Sleduj, kam plynou peníze opakovaně._")
     await reply_long(update.message, "\n".join(lines))
-
 
 async def whaleradar_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Zapne/vypne proaktivní Whale Radar pro tento chat."""
@@ -3242,7 +3143,6 @@ async def genius_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: await msg.edit_text(text, parse_mode="Markdown")
     except Exception: await msg.edit_text(text.replace("*", "").replace("`", "").replace("_", ""))
 
-
 async def edge_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """🔬 Edge Lab — backtestuje úspěšnost setupů na historii (`/edge AAPL [roky]`)."""
     if not ctx.args:
@@ -3268,23 +3168,6 @@ async def edge_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         text = f"❌ Chyba: {e}"
 
-    try: await msg.edit_text(text, parse_mode="Markdown")
-    except Exception: await msg.edit_text(text.replace("*", "").replace("`", "").replace("_", ""))
-
-
-async def setup_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Použití: `/setup ASTS`", parse_mode="Markdown")
-        return
-        
-    ticker = ctx.args[0].upper()
-    msg = await update.message.reply_text(f"⏳ Kalkuluji Confluence Setup pro *{ticker}*...", parse_mode="Markdown")
-    
-    try:
-        text = await asyncio.to_thread(analyze_setup, ticker)
-    except Exception as e:
-        text = f"❌ Při analýze nastala chyba: {e}"
-        
     try: await msg.edit_text(text, parse_mode="Markdown")
     except Exception: await msg.edit_text(text.replace("*", "").replace("`", "").replace("_", ""))
 
@@ -3382,7 +3265,6 @@ async def error_handler(update, context):
         return
     log.error("Neošetřená výjimka v handleru: %s", err, exc_info=err)
 
-
 def main():
     if not TOKEN:
         log.error("CHYBA: Chybí TELEGRAM_TOKEN! Nastav ho v .env souboru.")
@@ -3414,10 +3296,8 @@ def main():
     app.add_handler(CommandHandler(["edge", "backtest"], edge_cmd))
     app.add_handler(CommandHandler("earnings", earnings_cmd))
     app.add_handler(CallbackQueryHandler(ai_news_callback, pattern="^ainews_"))
-    app.add_handler(CommandHandler("setup", setup_cmd))
     app.add_handler(CommandHandler("nasdaq", nasdaq_cmd))
     app.add_handler(CommandHandler("walter", cmd_walter))
-    app.add_handler(CommandHandler("testwalter", cmd_testwalter))
     app.add_handler(CommandHandler("smc", smc_cmd))
     app.add_handler(CommandHandler("sniper", sniper_cmd))
     app.add_handler(CommandHandler("darkhorse", darkhorse_cmd))
