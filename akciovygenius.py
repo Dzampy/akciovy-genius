@@ -66,6 +66,10 @@ WALTER_COOLDOWN_MIN = int(os.getenv("WALTER_COOLDOWN_MIN", "10"))    # min. odst
 FIXED_RISK_PCT_FALLBACK = float(os.getenv("WALTER_FIXED_RISK_PCT", "0.008"))  # když ATR chybí
 WALTER_DEDUP_HISTORY = int(os.getenv("WALTER_DEDUP_HISTORY", "30"))  # kolik posledních zpráv pamatovat
 
+# ── SMC konfigurace ───────────────────────────────────────────────────────────
+# Max stáří zóny (v svíčkách), kterou ještě kreslíme — starší = stale, zaneřádí graf.
+SMC_ZONE_MAX_AGE = int(os.getenv("SMC_ZONE_MAX_AGE", "60"))
+
 # Runtime stav pro Walter (rate-limiting alertů na ticker)
 _walter_last_alert = {}            # {ticker: timestamp posledního alertu}
 _WALTER_SEEN_FILE = "walter_seen.json"
@@ -1234,7 +1238,7 @@ def get_smc_zones(df):
                     if highs[i] <= ob_t:
                         break  # impulz neprorazil nad OB → neplatné
                     status = zone_status(ob_t, ob_b, i, 'bull')
-                    bull_ob.append({'top': ob_t, 'bot': ob_b, 'start_idx': idx[k],
+                    bull_ob.append({'top': ob_t, 'bot': ob_b, 'start_idx': idx[k], 'pos': k,
                                     'vol': float(vols[k]), 'status': status,
                                     'mitigated': status == 'tapped'})
                     break
@@ -1246,7 +1250,7 @@ def get_smc_zones(df):
                     if lows[i] >= ob_b:
                         break
                     status = zone_status(ob_t, ob_b, i, 'bear')
-                    bear_ob.append({'top': ob_t, 'bot': ob_b, 'start_idx': idx[k],
+                    bear_ob.append({'top': ob_t, 'bot': ob_b, 'start_idx': idx[k], 'pos': k,
                                     'vol': float(vols[k]), 'status': status,
                                     'mitigated': status == 'tapped'})
                     break
@@ -1256,27 +1260,38 @@ def get_smc_zones(df):
         if lows[i] > highs[i - 2]:  # bullish FVG
             top, bot = float(lows[i]), float(highs[i - 2])
             status = zone_status(top, bot, i, 'bull')
-            bull_fvg.append({'top': top, 'bot': bot, 'start_idx': idx[i - 1],
+            bull_fvg.append({'top': top, 'bot': bot, 'start_idx': idx[i - 1], 'pos': i - 1,
                              'status': status, 'mitigated': status == 'tapped'})
         if highs[i] < lows[i - 2]:  # bearish FVG
             top, bot = float(lows[i - 2]), float(highs[i])
             status = zone_status(top, bot, i, 'bear')
-            bear_fvg.append({'top': top, 'bot': bot, 'start_idx': idx[i - 1],
+            bear_fvg.append({'top': top, 'bot': bot, 'start_idx': idx[i - 1], 'pos': i - 1,
                              'status': status, 'mitigated': status == 'tapped'})
 
-    def dedup(zones):
-        seen, out = set(), []
+    def merge_overlap(zones):
+        """Sloučí překrývající se zóny stejného typu (odstraní skoro-duplicity).
+        Výsledná zóna pokrývá sjednocení rozsahů, origin = ta novější svíčka."""
+        zones = sorted(zones, key=lambda z: z['bot'])
+        out = []
         for z in zones:
-            key = (round(z['top'], 6), round(z['bot'], 6))
-            if key not in seen:
-                seen.add(key)
-                out.append(z)
+            if out and z['bot'] <= out[-1]['top']:  # překryv s poslední
+                m = out[-1]
+                m['top'] = max(m['top'], z['top'])
+                m['bot'] = min(m['bot'], z['bot'])
+                if z['pos'] > m['pos']:                      # ponech novější origin
+                    m['pos'], m['start_idx'] = z['pos'], z['start_idx']
+                if m.get('status') == 'tapped' and z.get('status') == 'fresh':
+                    m['status'], m['mitigated'] = 'fresh', False
+            else:
+                out.append(dict(z))
         return out
 
-    # Zahoď prolomené (broken) zóny — jsou neplatné, nekreslíme je.
-    # FRESH FIRST + PROXIMITY: nezasažené mají přednost, pak nejbližší k ceně.
+    # Filtry: zahoď prolomené (broken) i příliš staré (stale) zóny — obojí jen
+    # zaneřádí graf. Pak slouč překryvy a vyber nejrelevantnější (fresh + blízké).
     def rank(zones, edge):
-        zones = [z for z in dedup(zones) if z.get('status') != 'broken']
+        zones = [z for z in zones
+                 if z.get('status') != 'broken' and (n - z['pos']) <= SMC_ZONE_MAX_AGE]
+        zones = merge_overlap(zones)
         return sorted(zones, key=lambda z: (z.get('mitigated', False),
                                             abs(current_price - z[edge])))[:3]
 
