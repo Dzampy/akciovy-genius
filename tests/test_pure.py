@@ -169,6 +169,58 @@ def test_genius_fuse_no_setup_is_zero_tech_bias():
     assert "BULLISH" in r["direction"]   # směr táhne flow
 
 
+def test_simulate_trade_target_hit():
+    # cena dorazí na target → win, R = zisk/riziko
+    sim = ag.simulate_trade(100, 95, 110, [105, 111], [99, 104], [104, 108], 5)
+    assert sim["outcome"] == "target"
+    assert abs(sim["ret"] - 0.10) < 1e-9
+    assert abs(sim["r"] - 2.0) < 1e-9      # 10 % zisk / 5 % riziko
+    assert sim["bars"] == 2
+
+
+def test_simulate_trade_stop_hit():
+    sim = ag.simulate_trade(100, 95, 110, [101, 102], [96, 94], [100, 95], 5)
+    assert sim["outcome"] == "stop"
+    assert abs(sim["ret"] + 0.05) < 1e-9
+    assert abs(sim["r"] + 1.0) < 1e-9
+
+
+def test_simulate_trade_stop_priority_same_bar():
+    # když svíčka protne stop i target naráz → konzervativně STOP
+    sim = ag.simulate_trade(100, 95, 110, [110], [95], [100], 5)
+    assert sim["outcome"] == "stop"
+
+
+def test_simulate_trade_timeout():
+    sim = ag.simulate_trade(100, 90, 120, [101, 102, 103], [99, 98, 97], [100, 101, 102], 3)
+    assert sim["outcome"] == "timeout"
+    assert abs(sim["ret"] - 0.02) < 1e-9
+    assert sim["bars"] == 3
+
+
+def test_simulate_trade_invalid_inputs():
+    assert ag.simulate_trade(100, 100, 110, [1], [1], [1], 5) is None   # stop >= entry
+    assert ag.simulate_trade(100, 95, 100, [1], [1], [1], 5) is None    # target <= entry
+
+
+def test_aggregate_edge_math():
+    trades = [
+        {"ret": 0.10, "r": 2.0, "outcome": "target", "bars": 2},
+        {"ret": -0.05, "r": -1.0, "outcome": "stop", "bars": 1},
+        {"ret": 0.02, "r": 0.4, "outcome": "timeout", "bars": 3},
+    ]
+    a = ag._aggregate_edge(trades)
+    assert a["n"] == 3
+    assert abs(a["wr"] - 2 / 3) < 1e-9
+    assert abs(a["exp_r"] - (1.4 / 3)) < 1e-9
+    assert abs(a["pf"] - (0.12 / 0.05)) < 1e-9
+    assert a["target_hits"] == 1 and a["stop_hits"] == 1 and a["timeouts"] == 1
+
+
+def test_aggregate_edge_empty():
+    assert ag._aggregate_edge([]) is None
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
