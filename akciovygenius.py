@@ -39,6 +39,10 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(), logging.FileHandler("bot.log", encoding="utf-8")],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+# yfinance loguje delistované/neplatné tickery na ERROR úrovni. Při plošných
+# skenech (agent, /darkhorse z Russellu) to zaplevelí log — skener je stejně
+# tiše přeskočí, takže ztlumíme jen tenhle šum (CRITICAL = jen fatální zprávy).
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 log = logging.getLogger("akciovygenius")
 
 log.info("🚀 Startuji Akciový Genius bota…")
