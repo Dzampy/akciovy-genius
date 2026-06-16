@@ -55,6 +55,13 @@ client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 if client is None:
     log.warning("GROQ_API_KEY chybí — AI funkce (news, walter, /ai) budou vypnuté.")
 
+# Dva modely s ODDĚLENÝMI denními kvótami (TPD) na Groq:
+#   - "heavy" 70b na finální analýzy (kvalitní text, běží zřídka)
+#   - "fast"  8b  na vysokofrekvenční klasifikaci (Walter detekce na KAŽDÉ zprávě)
+# Rozdělení šetří 100k/den limit 70b — 8b má vlastní mnohem větší kvótu.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_FAST_MODEL = os.getenv("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
+
 active_snipers = {}
 
 # ── Walter (makro feed) konfigurace ───────────────────────────────────────────
@@ -210,19 +217,29 @@ def _walter_confidence(vol_mult: float):
 
 # ── Helper: volání Groq s pojistkou proti chybějícímu klíči ───────────────────
 async def ask_groq(prompt: str, temperature: float = 0.2,
-                   model: str = "llama-3.3-70b-versatile"):
+                   model: str = None):
     """Zavolá Groq chat completion a vrátí text odpovědi.
-    Když klient není nakonfigurovaný (chybí GROQ_API_KEY), vrátí None."""
+    Když klient není nakonfigurovaný (chybí GROQ_API_KEY), vrátí None.
+    Při rate-limitu (429 / vyčerpané TPD) NEpadá — vrátí None a jen zaloguje,
+    aby smyčka cyklus tiše přeskočila místo vyhození výjimky."""
     if client is None:
         log.warning("Pokus o volání Groq bez klíče — přeskakuji.")
         return None
-    resp = await asyncio.to_thread(
-        client.chat.completions.create,
-        messages=[{"role": "user", "content": prompt}],
-        model=model,
-        temperature=temperature,
-    )
-    return resp.choices[0].message.content
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            messages=[{"role": "user", "content": prompt}],
+            model=model or GROQ_MODEL,
+            temperature=temperature,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        msg = str(e)
+        if "rate_limit" in msg or "429" in msg:
+            log.warning("[GROQ] Rate-limit (%s) — přeskakuji volání.", model or GROQ_MODEL)
+        else:
+            log.warning("[GROQ] Volání selhalo: %s", msg)
+        return None
 
 # ── Jednoduchá TTL cache pro yfinance stahování ───────────────────────────────
 _YF_CACHE: dict = {}
@@ -2732,7 +2749,8 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
         }}
         """
         
-        ai_raw = await ask_groq(prompt_detekce, temperature=0)
+        # Detekce = jednoduchá klasifikace → levný 8b model (šetří 70b denní kvótu).
+        ai_raw = await ask_groq(prompt_detekce, temperature=0, model=GROQ_FAST_MODEL)
         if ai_raw is None:
             return
         ai_text = ai_raw.replace("```json", "").replace("```", "").strip()
