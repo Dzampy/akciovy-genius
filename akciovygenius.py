@@ -294,17 +294,22 @@ def _looks_like_block(exc_msg: str) -> bool:
                ("crumb", "401", "429", "too many", "rate", "forbidden", "throttl"))
 
 def yf_download(ticker, period=None, interval="1d", *, start=None,
-                tries: int = 3, **kwargs):
+                tries: int = 3, empty_tries: int = 1, **kwargs):
     """yf.download s anti-blocking session a retry-with-backoff.
 
-    Retryuje jak na prázdný DataFrame, tak na výjimku — oboje je při hromadném
-    skenu typicky projev blokace, ne neexistence dat. Po vyčerpání pokusů vrací
-    prázdný DataFrame (volající ho už umí přeskočit). Persistentní blok loguje
-    WARNING (skutečný signál), prosté prázdno jen DEBUG (nejspíš neplatný ticker)."""
+    Dvě různé příčiny selhání → dvě různé strategie (jinak by hromadný sken
+    Russellu trval věčnost na mrtvých tickerech):
+      • VÝJIMKA (401 Invalid Crumb, 429, …) = reálná blokace → retry až `tries`×
+        s exponenciálním backoffem; persistentní blok = WARNING (skutečný signál).
+      • PRÁZDNÝ DataFrame bez výjimky = nejčastěji neplatný/mrtvý ticker → retry
+        jen `empty_tries`× (default 1 = bez retry, vrať hned). Impersonace session
+        řeší soft-blok u zdroje, takže nemá smysl pálit 3 pokusy na každé prázdno.
+    Vrací prázdný DataFrame, když nic nepřišlo (volající ho už umí přeskočit)."""
     kwargs.setdefault("auto_adjust", True)
     kwargs.setdefault("progress", False)
     kwargs.setdefault("group_by", "ticker")
     last_exc = None
+    empty_seen = 0
     for attempt in range(tries):
         try:
             params = dict(kwargs)
@@ -319,18 +324,24 @@ def yf_download(ticker, period=None, interval="1d", *, start=None,
             df = yf.download(ticker, **params)
             if df is not None and not df.empty:
                 return df
+            # prázdno bez výjimky → mrtvý ticker; nepálit plný retry
+            empty_seen += 1
+            if empty_seen >= empty_tries:
+                log.debug("[YF] %s: prázdná odpověď (nejspíš neplatný ticker).", ticker)
+                return pd.DataFrame()
+            backoff = 0.4 + random.uniform(0, 0.3)           # krátký, plochý
         except Exception as e:
             last_exc = e
-            _yf_tls.session = None  # zahoď možná „zaseknutou" session
+            _yf_tls.session = None                            # zahoď zaseknutou session
+            backoff = 0.8 * (2 ** attempt) + random.uniform(0, 0.6)  # exponenciální
         if attempt < tries - 1:
-            time.sleep(0.8 * (2 ** attempt) + random.uniform(0, 0.6))
+            time.sleep(backoff)
 
     if last_exc is not None and _looks_like_block(str(last_exc)):
         log.warning("[YF] %s: Yahoo nás zřejmě blokuje (%s) — vyčerpáno %d pokusů.",
                     ticker, last_exc, tries)
-    else:
-        log.debug("[YF] %s: prázdná odpověď po %d pokusech (%s).",
-                  ticker, tries, last_exc or "no data")
+    elif last_exc is not None:
+        log.debug("[YF] %s: stažení selhalo (%s).", ticker, last_exc)
     return pd.DataFrame()
 
 def yf_ticker(ticker):
@@ -421,8 +432,14 @@ async def scan_universe(tickers, worker, *, concurrency=SCAN_CONCURRENCY, delay=
     ve stejném pořadí jako `tickers`.
     """
     sem = asyncio.Semaphore(concurrency)
+    total = len(tickers)
+    done = 0
+    # Heartbeat do logu: u dlouhých skenů (Russell ~2000) jinak 20–30 min ticho
+    # a nepoznáš, jestli to jede nebo visí. Logni progres každých ~10 %.
+    step = max(1, total // 10)
 
     async def run(tk):
+        nonlocal done
         async with sem:
             await asyncio.sleep(delay)
             try:
@@ -432,6 +449,10 @@ async def scan_universe(tickers, worker, *, concurrency=SCAN_CONCURRENCY, delay=
             except Exception as e:
                 log.debug("[SCAN] %s chyba: %s", tk, e)
                 return None
+            finally:
+                done += 1
+                if total >= 50 and (done % step == 0 or done == total):
+                    log.info("[SCAN] průběh %d/%d (%d %%)", done, total, done * 100 // total)
 
     return await asyncio.gather(*[run(tk) for tk in tickers])
 
