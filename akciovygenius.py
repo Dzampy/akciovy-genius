@@ -816,6 +816,50 @@ def classify_setup(ind: dict, flow_score_val: float = 0.0) -> dict:
         "dist_to_zone_pct": dist_to_zone_pct,
     }
 
+def _fmt_price(p) -> str:
+    """Cena s adaptivní přesností — levné/penny tickery potřebují víc desetin."""
+    if p is None:
+        return "?"
+    if p < 1:    return f"${p:.4f}"
+    if p < 10:   return f"${p:.3f}"
+    return f"${p:.2f}"
+
+def build_entry_ladder(zone_bot: float, zone_top: float, last: float, atr: float,
+                       stop: float, t1: float, t2: float) -> dict:
+    """Rozloží swing vstup do 2–3 limitek napříč buy zónou (pyramida = víc dolů).
+
+    • Počet tranší volí model podle šířky zóny vs ATR: úzká zóna → 2, široká → 3.
+    • Váhy jsou pyramidové — nejmenší nákup na vršku zóny (první dotek), největší
+      dole (nejlepší cena). Tím Ø vstup padne blíž ke spodku zóny.
+    • R:R se počítá od *váženého průměrného vstupu*, ne od středu zóny — poctivější.
+
+    Vrací tranše (cena, váha, popisek) + Ø vstup + R:R na T1/T2 + vzdálenost stopu."""
+    if zone_top < zone_bot:                      # ochrana proti degenerované zóně
+        zone_bot, zone_top = zone_top, zone_bot
+    width = zone_top - zone_bot
+
+    if atr > 0 and width >= 0.6 * atr:
+        prices  = [zone_top, (zone_top + zone_bot) / 2.0, zone_bot]
+        weights = [0.25, 0.35, 0.40]
+        labels  = ["vršek zóny (první dotek)", "střed zóny", "spodek zóny (nejlepší cena)"]
+    else:
+        prices  = [zone_top, zone_bot]
+        weights = [0.40, 0.60]
+        labels  = ["vršek zóny (první dotek)", "spodek zóny (nejlepší cena)"]
+
+    avg_entry = sum(p * w for p, w in zip(prices, weights))
+    risk = avg_entry - stop
+    rr1 = (t1 - avg_entry) / risk if risk > 0 else 0.0
+    rr2 = (t2 - avg_entry) / risk if risk > 0 else 0.0
+    stop_pct = (stop / avg_entry - 1.0) * 100.0 if avg_entry > 0 else 0.0
+
+    return {
+        "tranches": [{"price": p, "weight": w, "label": lab}
+                     for p, w, lab in zip(prices, weights, labels)],
+        "avg_entry": avg_entry, "rr1": rr1, "rr2": rr2,
+        "stop_pct": stop_pct, "n": len(prices),
+    }
+
 def make_chart(ticker: str, interval: str = "1d", render: bool = True, flow: bool = True):
     if interval in ["1h", "4h"]:
         png, text = make_sr_chart(ticker, interval)
@@ -865,6 +909,30 @@ def make_chart(ticker: str, interval: str = "1d", render: bool = True, flow: boo
     pullback_risk = res["pullback_risk"]
     dist_to_zone_pct = res["dist_to_zone_pct"]
 
+    # ── Entry plan (žebřík limitek) — jen u obchodovatelného setupu ───────────
+    ladder = None
+    entry_plan_lines: list[str] = []
+    show_ladder = (setup_type != "⚠️ No Setup"
+                   and "VYHNOUT" not in status and "PROPADLO" not in status)
+    if show_ladder:
+        ladder = build_entry_ladder(best_zone_bot, best_zone_top, last, atr,
+                                    stop_loss, target1, target2)
+        num_emoji = ["1️⃣", "2️⃣", "3️⃣"]
+        entry_plan_lines = ["━━━━━━━━━━━━━━━━━━━━━━", "📋 *ENTRY PLAN (žebřík)*"]
+        for i, tr in enumerate(ladder["tranches"]):
+            entry_plan_lines.append(
+                f" {num_emoji[i]} `{_fmt_price(tr['price'])}`  {tr['weight']*100:.0f} %  "
+                f"_{tr['label']}_"
+            )
+        rr1 = ladder["rr1"]
+        verdikt = ("✅ vyplatí se" if rr1 >= 2 else
+                   "🟡 hraniční" if rr1 >= 1.5 else "🔴 slabý R:R")
+        entry_plan_lines += [
+            f"Ø vstup `{_fmt_price(ladder['avg_entry'])}` · "
+            f"stop `{_fmt_price(stop_loss)}` ({ladder['stop_pct']:+.1f} %)",
+            f"R:R od Ø vstupu `1:{rr1:.1f}` (T1) · `1:{ladder['rr2']:.1f}` (T2)  →  {verdikt}",
+        ]
+
     fmt = "%Y-%m-%d %H:%M"
     x_dates = df.index.strftime(fmt)
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.8, 0.2])
@@ -909,6 +977,7 @@ def make_chart(ticker: str, interval: str = "1d", render: bool = True, flow: boo
         f"📍 *Buy Zone:* `${best_zone_bot:.2f} - ${best_zone_top:.2f}`",
         f"💵 *Aktuálně:* `${last:.2f}`",
         f"🚦 *Status:* {status}",
+        *entry_plan_lines,
         "",
         "🧭 *MULTI-TIMEFRAME CONTEXT*",
         f"daily_bias: `{daily_bias}`",
@@ -945,6 +1014,7 @@ def make_chart(ticker: str, interval: str = "1d", render: bool = True, flow: boo
         "mom_ok": sm_mom == 1,
         "vol_ok": sm_vol == 1,
         "last": last,
+        "ladder": ladder,
     }
 
     return png, "\n".join(lines), data

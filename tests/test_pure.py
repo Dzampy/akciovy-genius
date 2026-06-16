@@ -291,6 +291,45 @@ def test_invest_profile_empty_is_safe():
     assert "Nedostatek dat" in r["verdict"]
 
 
+def test_entry_ladder_wide_zone_three_tranches():
+    L = ag.build_entry_ladder(zone_bot=1.06, zone_top=1.18, last=1.21,
+                              atr=0.10, stop=0.99, t1=1.40, t2=1.75)
+    assert L["n"] == 3                                  # široká zóna (>=0.6 ATR)
+    assert [t["weight"] for t in L["tranches"]] == [0.25, 0.35, 0.40]   # pyramida
+    p = [t["price"] for t in L["tranches"]]
+    assert p[0] > p[1] > p[2]                           # ceny klesají k spodku zóny
+
+
+def test_entry_ladder_narrow_zone_two_tranches():
+    L = ag.build_entry_ladder(zone_bot=1.15, zone_top=1.18, last=1.21,
+                              atr=0.10, stop=1.05, t1=1.40, t2=1.75)
+    assert L["n"] == 2                                  # úzká zóna (<0.6 ATR)
+    assert [t["weight"] for t in L["tranches"]] == [0.40, 0.60]
+
+
+def test_entry_ladder_avg_is_pyramid_weighted():
+    # Vážený Ø vstup musí být blíž spodku zóny než prostý aritmetický střed.
+    L = ag.build_entry_ladder(zone_bot=1.06, zone_top=1.18, last=1.21,
+                              atr=0.10, stop=0.99, t1=1.40, t2=1.75)
+    assert L["avg_entry"] < (1.06 + 1.18) / 2.0
+
+
+def test_entry_ladder_rr_from_avg_beats_top_entry():
+    # R:R od Ø vstupu musí být lepší než od vršku zóny (lepší Ø cena = vyšší R:R).
+    L = ag.build_entry_ladder(zone_bot=1.06, zone_top=1.18, last=1.21,
+                              atr=0.10, stop=0.99, t1=1.40, t2=1.75)
+    rr1_from_top = (1.40 - 1.18) / (1.18 - 0.99)
+    assert L["rr1"] > rr1_from_top > 0
+    assert L["rr2"] > L["rr1"]                          # vzdálenější cíl = vyšší R:R
+    assert L["stop_pct"] < 0                            # stop je pod vstupem
+
+
+def test_fmt_price_adaptive_precision():
+    assert ag._fmt_price(0.0625) == "$0.0625"          # penny → 4 desetiny
+    assert ag._fmt_price(1.234) == "$1.234"            # < 10 → 3 desetiny
+    assert ag._fmt_price(187.4) == "$187.40"           # ≥ 10 → 2 desetiny
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
