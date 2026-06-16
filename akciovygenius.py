@@ -7,6 +7,7 @@ import hashlib
 import threading
 import atexit
 import logging
+import random
 from datetime import datetime, timezone
 import os
 import re
@@ -39,9 +40,10 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(), logging.FileHandler("bot.log", encoding="utf-8")],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
-# yfinance loguje delistované/neplatné tickery na ERROR úrovni. Při plošných
-# skenech (agent, /darkhorse z Russellu) to zaplevelí log — skener je stejně
-# tiše přeskočí, takže ztlumíme jen tenhle šum (CRITICAL = jen fatální zprávy).
+# yfinance loguje na ERROR zavádějící „possibly delisted; no price data found"
+# i tehdy, když je ticker platný a jen nás Yahoo zablokoval/rate-limitnul. Ten
+# per-ticker šum ztlumíme (CRITICAL) — SKUTEČNÝ signál o blokaci teď dává náš
+# vlastní wrapper yf_download() (WARNING) po vyčerpání retry s impersonací.
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 log = logging.getLogger("akciovygenius")
 
@@ -245,6 +247,97 @@ async def ask_groq(prompt: str, temperature: float = 0.2,
             log.warning("[GROQ] Volání selhalo: %s", msg)
         return None
 
+# ── yfinance: anti-blocking session + retry ───────────────────────────────────
+# Yahoo nás při hromadných skenech (agent, /darkhorse z Russellu) rate-limituje
+# a blokuje. Příznak: yfinance vrátí prázdno a zaloguje zavádějící
+# „possibly delisted; no price data found" — ačkoli ticker JE platný; ve
+# skutečnosti nás Yahoo jen odřízl (často 401 Invalid Crumb / 429). Bez obrany
+# tím agent TIŠE přichází o data a zahazuje validní picky.
+#
+# Dvě obranné vrstvy:
+#   1) curl_cffi session s impersonací prohlížeče — obejde TLS/JA3 fingerprint
+#      blok, na který Yahoo defaultní requests session chytá.
+#   2) retry s exponenciálním backoffem + jitterem na prázdnou/selhanou odpověď.
+#
+# Session je THREAD-LOCAL: curl_cffi Session není bezpečná pro sdílení napříč
+# vlákny a skeny běží přes asyncio.to_thread, takže každé vlákno má vlastní.
+try:
+    from curl_cffi import requests as _curl_requests
+    _HAS_CURL = True
+except Exception:
+    _HAS_CURL = False
+    log.warning("curl_cffi není dostupné — yfinance pojede bez impersonace "
+                "(vyšší riziko blokace od Yahoo).")
+
+_yf_tls = threading.local()
+
+def _yf_session():
+    """Thread-local curl_cffi session s impersonací Chrome (líně vytvořená).
+    Vrací None, když curl_cffi chybí → yfinance použije vlastní default session."""
+    if not _HAS_CURL:
+        return None
+    s = getattr(_yf_tls, "session", None)
+    if s is None:
+        try:
+            s = _curl_requests.Session(impersonate="chrome")
+        except Exception as e:
+            log.debug("[YF] nelze vytvořit curl_cffi session: %s", e)
+            return None
+        _yf_tls.session = s
+    return s
+
+def _looks_like_block(exc_msg: str) -> bool:
+    """Heuristika: vypadá chyba na blokaci/rate-limit od Yahoo (vs. opravdu
+    chybějící data)? Slouží k odlišení vážného signálu od běžného šumu."""
+    m = exc_msg.lower()
+    return any(t in m for t in
+               ("crumb", "401", "429", "too many", "rate", "forbidden", "throttl"))
+
+def yf_download(ticker, period=None, interval="1d", *, start=None,
+                tries: int = 3, **kwargs):
+    """yf.download s anti-blocking session a retry-with-backoff.
+
+    Retryuje jak na prázdný DataFrame, tak na výjimku — oboje je při hromadném
+    skenu typicky projev blokace, ne neexistence dat. Po vyčerpání pokusů vrací
+    prázdný DataFrame (volající ho už umí přeskočit). Persistentní blok loguje
+    WARNING (skutečný signál), prosté prázdno jen DEBUG (nejspíš neplatný ticker)."""
+    kwargs.setdefault("auto_adjust", True)
+    kwargs.setdefault("progress", False)
+    kwargs.setdefault("group_by", "ticker")
+    last_exc = None
+    for attempt in range(tries):
+        try:
+            params = dict(kwargs)
+            params["interval"] = interval
+            if period is not None:
+                params["period"] = period
+            if start is not None:
+                params["start"] = start
+            sess = _yf_session()
+            if sess is not None:
+                params["session"] = sess
+            df = yf.download(ticker, **params)
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            last_exc = e
+            _yf_tls.session = None  # zahoď možná „zaseknutou" session
+        if attempt < tries - 1:
+            time.sleep(0.8 * (2 ** attempt) + random.uniform(0, 0.6))
+
+    if last_exc is not None and _looks_like_block(str(last_exc)):
+        log.warning("[YF] %s: Yahoo nás zřejmě blokuje (%s) — vyčerpáno %d pokusů.",
+                    ticker, last_exc, tries)
+    else:
+        log.debug("[YF] %s: prázdná odpověď po %d pokusech (%s).",
+                  ticker, tries, last_exc or "no data")
+    return pd.DataFrame()
+
+def yf_ticker(ticker):
+    """yf.Ticker s thread-local impersonační session (anti-blocking)."""
+    sess = _yf_session()
+    return yf.Ticker(ticker, session=sess) if sess is not None else yf.Ticker(ticker)
+
 # ── Jednoduchá TTL cache pro yfinance stahování ───────────────────────────────
 _YF_CACHE: dict = {}
 _YF_CACHE_MAX = 256   # strop záznamů, ať cache neroste donekonečna (memory-leak)
@@ -262,8 +355,7 @@ def cached_yf_download(ticker: str, period: str, interval: str, ttl: int = 300):
     if cached and now - cached[0] < ttl:
         return cached[1].copy()
 
-    df = yf.download(ticker, period=period, interval=interval,
-                     auto_adjust=True, progress=False, group_by="ticker")
+    df = yf_download(ticker, period=period, interval=interval)
 
     if df is None or df.empty:
         return df if df is not None else pd.DataFrame()  # neukládej prázdno
@@ -1116,7 +1208,7 @@ def _rec_label(key) -> str:
 
 def _gather_fundamentals(ticker: str) -> dict:
     """Stáhne fundamenty z yfinance, převede jednotky a spočítá všechny kategorie."""
-    tk = yf.Ticker(ticker)
+    tk = yf_ticker(ticker)
     try:
         info = tk.info or {}
     except Exception:
@@ -1458,7 +1550,7 @@ def flow_accumulation(ticker: str, opt_type: str, strike: float, exp: str) -> di
 
 def analyze_options_flow(ticker: str, spot: float) -> tuple[list[dict], float]:
     if spot <= 0: return [], 0.0
-    tk = yf.Ticker(ticker)
+    tk = yf_ticker(ticker)
     
     try:
         info = tk.info
@@ -1654,7 +1746,7 @@ def format_unusual(ticker: str, hits: list[dict], spot: float, market_cap: float
 
 async def get_net_whale_flow(ticker: str) -> dict:
     try:
-        tk = yf.Ticker(ticker)
+        tk = yf_ticker(ticker)
         hist = await asyncio.to_thread(tk.history, period="1d")
         if hist.empty:
             return None
@@ -1725,7 +1817,7 @@ def _whale_dedup_ok(key: str) -> bool:
 def scan_ticker_whales(ticker: str) -> list[dict]:
     """Najde velké agresivní směrové opční bloky pro jeden ticker (sync, do to_thread)."""
     try:
-        tk = yf.Ticker(ticker)
+        tk = yf_ticker(ticker)
         hist = tk.history(period="1d")
         if hist.empty:
             return []
@@ -2020,7 +2112,7 @@ async def get_news_sentiment(ticker: str) -> dict | None:
 def _next_earnings_days(ticker: str):
     """Počet dní do nejbližších earnings (None = neznámé)."""
     try:
-        cal = yf.Ticker(ticker).calendar
+        cal = yf_ticker(ticker).calendar
         ed = None
         if isinstance(cal, dict):
             ed = cal.get("Earnings Date")
@@ -2055,7 +2147,7 @@ async def gather_genius(ticker: str) -> dict:
 
     async def get_flow():
         try:
-            tk = yf.Ticker(ticker)
+            tk = yf_ticker(ticker)
             hist = await asyncio.to_thread(tk.history, period="1d")
             if hist.empty:
                 return None
@@ -2160,8 +2252,7 @@ def backtest_setups(ticker: str, years: int = EDGE_DEFAULT_YEARS,
     Flow se historicky přehrát nedá (chybí archiv opcí), proto backtest běží
     flow=0 a testuje čistě technickou detekci setupu. Skóre tím není gate —
     rozhoduje typ setupu a geometrie R:R, které jsou na flow nezávislé."""
-    df = yf.download(ticker, period=f"{years}y", interval="1d",
-                     auto_adjust=True, progress=False, group_by="ticker")
+    df = yf_download(ticker, period=f"{years}y", interval="1d")
     if df is None or df.empty:
         return None
     if isinstance(df.columns, pd.MultiIndex):
@@ -2419,7 +2510,7 @@ async def produce_edge(ticker: str, years: int = EDGE_DEFAULT_YEARS) -> str:
 async def produce_flow_ticker(ticker: str) -> str:
     """Hloubkový pohled na opční flow jednoho tickeru (dřív /unusual)."""
     try:
-        tk = yf.Ticker(ticker)
+        tk = yf_ticker(ticker)
         hist = await asyncio.wait_for(asyncio.to_thread(tk.history, period="1d"), timeout=30.0)
         if hist.empty:
             return f"❌ Nepodařilo se načíst tržní cenu pro *{ticker}*."
@@ -2523,7 +2614,7 @@ async def produce_nasdaq() -> str:
 async def produce_darkhorse() -> str:
     watchlist = load_russell_watchlist()
     try:
-        await asyncio.to_thread(yf.download, "SPY", period="1d", progress=False)
+        await asyncio.to_thread(yf_download, "SPY", period="1d")
     except Exception:
         pass
     def scan_darkhorse(ticker):
@@ -2994,7 +3085,7 @@ def _agent_eval_one(rec: dict) -> dict | None:
         return {"status": "void", "result": "void", "ret_pct": None, "closed_ts": now_iso}
     try:
         start_date = datetime.fromisoformat(rec["ts"]).date().isoformat()
-        hist = yf.Ticker(rec["ticker"]).history(start=start_date)
+        hist = yf_ticker(rec["ticker"]).history(start=start_date)
     except Exception:
         return None
     if hist is None or hist.empty:
@@ -3545,7 +3636,7 @@ async def sniper_background_task(context: ContextTypes.DEFAULT_TYPE):
         for ticker in list(tickers):
             try:
                 df = await asyncio.wait_for(
-                    asyncio.to_thread(yf.download, ticker, period="3d", interval="15m", progress=False),
+                    asyncio.to_thread(yf_download, ticker, period="3d", interval="15m"),
                     timeout=20.0,
                 )
                 if df.empty: continue
@@ -3711,7 +3802,7 @@ async def walter_macro_loop(context: ContextTypes.DEFAULT_TYPE):
                 log.error("Chyba Binance API: %s", e)
 
         else:
-            data_1m = await asyncio.to_thread(yf.download, target_ticker, period="1d", interval="1m", progress=False)
+            data_1m = await asyncio.to_thread(yf_download, target_ticker, period="1d", interval="1m")
             if not data_1m.empty and len(data_1m) > 10:
                 if isinstance(data_1m.columns, pd.MultiIndex):
                     if 'Close' in data_1m.columns.get_level_values(0):
