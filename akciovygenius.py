@@ -696,12 +696,24 @@ def classify_setup(ind: dict, flow_score_val: float = 0.0) -> dict:
     global_score = 0
     global_bd = []
 
-    if last < ema200:
+    # Dlouhodobý trend = základ teze. Nad EMA200 = zdravý uptrend (odměna),
+    # pod EMA200 = rozbitá teze (penalizace). Dřív se odměna chyběla úplně,
+    # takže čistý pullback v uptrendu strukturálně nemohl dosáhnout na práh.
+    if last >= ema200:
+        global_score += 15
+        global_bd.append("Nad EMA200      +15")
+    else:
         global_score -= 20
         global_bd.append("Pod EMA200      -20")
 
     if sm_trend: global_score += 10; global_bd.append("Trend Bullish   +10")
+    if sm_struct: global_score += 10; global_bd.append("Bull Structure  +10")
+
+    # RSI: hluboko přeprodané = silný odraz; mírný pullback (RSI 40–55) =
+    # zdravé nadechnutí v trendu, taky zaslouží kredit (ne jen oversold).
     if rsi < 40: global_score += 10; global_bd.append("RSI Oversold    +10")
+    elif rsi < 55: global_score += 5; global_bd.append("RSI Pullback    +5")
+
     if sm_vol: global_score += 10; global_bd.append("Volume Spike    +10")
     if mom_20d > 30: global_score += 20; global_bd.append("Mom > 30%       +20")
     elif mom_20d > 15: global_score += 10; global_bd.append("Mom > 15%       +10")
@@ -789,9 +801,27 @@ def classify_setup(ind: dict, flow_score_val: float = 0.0) -> dict:
     elif atr_dist < 2.5: pullback_risk = "Střední"
     else: pullback_risk = "Vysoký (Přetaženo)"
 
-    if best_total_score < 40 or rr_zone < 1.5:
-        summary = "Slabý R:R profil nebo nedostatečná konfluence pro vstup. Neobchodovatelný setup, posuň se dál."
+    # VYHNOUT je rezervováno pro SKUTEČNÉ red flagy, ne pro „chybí momentum bonus".
+    # Co dělá setup neobchodovatelný:
+    #   1) Špatný poměr risk/reward uvnitř zóny (R:R < 1.5) — riziko nevyplácí.
+    #   2) Rozbitý trend: pod EMA200 a zároveň bez býčí struktury (HH/HL) = downtrend.
+    #   3) Žádný validní setup (chybí supportní zóna i breakout).
+    # Skóre samotné je už jen kvalitativní známka (A/B/C/D), ne brána — čistý
+    # pullback v uptrendu s dobrým R:R tak už neskončí paušálně jako VYHNOUT.
+    broken_trend = (last < ema200) and not is_bull_struct
+    no_setup = setup_type == "⚠️ No Setup"
+
+    if rr_zone < 1.5 or broken_trend or no_setup:
+        if rr_zone < 1.5:
+            summary = f"Poměr risk/reward uvnitř zóny je slabý ({rr_zone:.1f} < 1.5). Riziko nevyvažuje potenciální zisk — posuň se dál."
+        elif broken_trend:
+            summary = "Cena je pod EMA200 bez býčí struktury (HH/HL). Dlouhodobá teze je rozbitá — nechytej padající nůž."
+        else:
+            summary = "Žádná validní supportní zóna ani breakout. Není z čeho stavět vstup."
         status = "🔴 VYHNOUT SE"
+    elif dist_to_zone_pct > 12:
+        summary = f"Nejbližší supportní zóna je {dist_to_zone_pct:.0f} % pod cenou — žádný blízký vstup. Cena je roztažená; buď počkej na hlubší pullback k zóně, nebo hledej jiný titul. Vstup tady = honba za cenou."
+        status = "📡 ROZTAŽENO (zóna daleko)"
     elif dist_to_zone_pct > 3:
         summary = f"Cena je nad ideální zónou. R:R nyní je neatraktivní ({rr_now:.1f}), ale uvnitř zóny je excelentní ({rr_zone:.1f}). Nastav si alert."
         status = f"⏳ ČEKEJ NA PULLBACK (-{dist_to_zone_pct:.1f}%)"
