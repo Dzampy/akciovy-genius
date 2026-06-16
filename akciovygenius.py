@@ -294,7 +294,7 @@ def _looks_like_block(exc_msg: str) -> bool:
                ("crumb", "401", "429", "too many", "rate", "forbidden", "throttl"))
 
 def yf_download(ticker, period=None, interval="1d", *, start=None,
-                tries: int = 3, empty_tries: int = 1, **kwargs):
+                tries: int = 3, empty_tries: int = 2, **kwargs):
     """yf.download s anti-blocking session a retry-with-backoff.
 
     Dvě různé příčiny selhání → dvě různé strategie (jinak by hromadný sken

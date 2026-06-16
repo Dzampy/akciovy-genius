@@ -1,5 +1,6 @@
 pandas==3.0.3
 yfinance==1.4.1
+curl_cffi==0.15.0
 plotly==6.8.0
 groq==1.4.0
 numpy==2.4.6
