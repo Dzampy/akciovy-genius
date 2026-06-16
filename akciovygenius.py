@@ -2295,49 +2295,458 @@ def format_edge(report: dict) -> str:
 # 4. TELEGRAM HANDLERY
 # ==============================================================================
 
+# ==============================================================================
+# 2.0 UI VRSTVA — interaktivní menu + kontextová navigace
+# ==============================================================================
+# Producenti vrací HOTOVÝ text → sdílí je slash-příkazy i callbacky (žádné dupl
+# logiky). Klávesnice dávají pod každý výstup tlačítka pro přepnutí analýzy na
+# stejném tickeru a /start funguje jako proklikávací rozcestník.
+
+# Pořadí tlačítek kontextové navigace pod výstupem k tickeru.
+_NAV_BUTTONS = [
+    ("profil", "🧭 Profil"),
+    ("genius", "🧠 Genius"),
+    ("flow",   "🌊 Flow"),
+    ("news",   "📰 News"),
+    ("chart",  "📈 Graf"),
+    ("edge",   "🔬 Edge"),
+]
+
+def nav_keyboard(ticker: str, exclude: str = "") -> InlineKeyboardMarkup:
+    """Kontextová tlačítka pod výstupem → 1 klik = stejná analýza jinou optikou."""
+    t = ticker.upper()
+    btns = [InlineKeyboardButton(lbl, callback_data=f"nav:{act}:{t}")
+            for act, lbl in _NAV_BUTTONS if act != exclude]
+    rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+    return InlineKeyboardMarkup(rows)
+
+def news_keyboard(ticker: str) -> InlineKeyboardMarkup:
+    """AI-analýza zpráv + standardní navigace."""
+    t = ticker.upper()
+    rows = [[InlineKeyboardButton("🧠 AI Analýza zpráv", callback_data=f"ainews_{t}")]]
+    rows += nav_keyboard(t, exclude="news").inline_keyboard
+    return InlineKeyboardMarkup(rows)
+
+def home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧭 Investor", callback_data="menu:investor"),
+         InlineKeyboardButton("🌊 Flow & Whales", callback_data="menu:flow")],
+        [InlineKeyboardButton("📈 Grafy & setupy", callback_data="menu:chart"),
+         InlineKeyboardButton("🌍 Makro", callback_data="menu:macro")],
+        [InlineKeyboardButton("🔍 Skenery", callback_data="menu:scan"),
+         InlineKeyboardButton("❓ Vše / Help", callback_data="menu:help")],
+    ])
+
+def back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Zpět do menu", callback_data="menu:home")]])
+
+def scan_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 NASDAQ TOP 10", callback_data="menu:run:nasdaq")],
+        [InlineKeyboardButton("🐳 Whale sken trhu", callback_data="menu:run:whales")],
+        [InlineKeyboardButton("🐎 Dark Horse (Russell)", callback_data="menu:run:darkhorse")],
+        [InlineKeyboardButton("⬅️ Zpět do menu", callback_data="menu:home")],
+    ])
+
+
+# ── Doručení textu (řeší 4096 limit + fallback bez Markdownu) ─────────────────
+async def reply_long_with_kb(message, text: str, keyboard, parse_mode: str = "Markdown") -> None:
+    """Pošle text po částech; klávesnici připne k poslední části."""
+    chunks = [text[i:i + TG_MSG_LIMIT] for i in range(0, len(text), TG_MSG_LIMIT)] or [text]
+    for idx, chunk in enumerate(chunks):
+        kb = keyboard if idx == len(chunks) - 1 else None
+        try:
+            await message.reply_text(chunk, parse_mode=parse_mode,
+                                     reply_markup=kb, disable_web_page_preview=True)
+        except Exception:
+            await message.reply_text(chunk.replace("*", "").replace("`", "").replace("_", ""),
+                                     reply_markup=kb)
+
+async def deliver_result(loading, base, text: str, keyboard) -> None:
+    """Edit loading zprávy výsledkem; když je moc dlouhý, smaž a pošli po částech."""
+    if len(text) <= TG_MSG_LIMIT:
+        try:
+            await loading.edit_text(text, parse_mode="Markdown",
+                                    reply_markup=keyboard, disable_web_page_preview=True)
+            return
+        except Exception:
+            try:
+                await loading.edit_text(text.replace("*", "").replace("`", "").replace("_", ""),
+                                        reply_markup=keyboard)
+                return
+            except Exception:
+                pass
+    try:
+        await loading.delete()
+    except Exception:
+        pass
+    await reply_long_with_kb(base, text, keyboard)
+
+
+# ── Producenti (text-vracející, sdílené příkazy i callbacky) ──────────────────
+async def produce_profil(ticker: str) -> str:
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(analyze_earnings, ticker), timeout=20.0)
+    except asyncio.TimeoutError:
+        return f"❌ Vypršel časový limit profilu *{ticker}* (20s)."
+    except Exception as e:
+        return f"❌ Chyba profilu *{ticker}*: {e}"
+
+async def produce_genius(ticker: str) -> str:
+    try:
+        r = await asyncio.wait_for(gather_genius(ticker), timeout=45.0)
+        text = format_genius(r)
+        await asyncio.to_thread(save_flow_history)
+        return text
+    except asyncio.TimeoutError:
+        return f"❌ Genius *{ticker}* trval moc dlouho."
+    except Exception as e:
+        return f"❌ Chyba: {e}"
+
+async def produce_edge(ticker: str, years: int = EDGE_DEFAULT_YEARS) -> str:
+    try:
+        report = await asyncio.wait_for(asyncio.to_thread(backtest_setups, ticker, years), timeout=90.0)
+        return format_edge(report)
+    except asyncio.TimeoutError:
+        return f"❌ Backtest *{ticker}* trval moc dlouho."
+    except Exception as e:
+        return f"❌ Chyba: {e}"
+
+async def produce_flow_ticker(ticker: str) -> str:
+    """Hloubkový pohled na opční flow jednoho tickeru (dřív /unusual)."""
+    try:
+        tk = yf.Ticker(ticker)
+        hist = await asyncio.wait_for(asyncio.to_thread(tk.history, period="1d"), timeout=30.0)
+        if hist.empty:
+            return f"❌ Nepodařilo se načíst tržní cenu pro *{ticker}*."
+        spot = float(hist["Close"].iloc[-1])
+        hits, market_cap = await asyncio.wait_for(
+            asyncio.to_thread(analyze_options_flow, ticker, spot), timeout=30.0)
+        text = format_unusual(ticker, hits, spot, market_cap)
+        await asyncio.to_thread(save_flow_history)
+        return text
+    except asyncio.TimeoutError:
+        return "❌ Skenování opčního trhu trvalo moc dlouho."
+    except Exception as e:
+        return f"❌ Chyba: {e}"
+
+async def produce_news(ticker: str):
+    """Vrací (text, items). Když nejsou zprávy → (None, None)."""
+    items = await asyncio.to_thread(fetch_yahoo_rss, ticker)
+    if not items:
+        return None, None
+    lines = [f"📰 *POSLEDNÍ ZPRÁVY: {ticker}*", "━━━━━━━━━━━━━━━━━━━━━━"]
+    for item in items:
+        lines.append(f"🔹 *[{item['title']}]({item['link']})*\n")
+    return "\n".join(lines), items
+
+async def produce_whales_scan() -> str:
+    """Plošný whale-flow sken smallcap watchlistu (dřív /whales)."""
+    watchlist = WHALE_SMALLCAPS
+    raw_results = await scan_universe(watchlist, get_net_whale_flow, delay=SCAN_DELAY_FLOW)
+    valid_results = [r for r in raw_results if r is not None and r["net_flow"] != 0]
+    zero_count = len(watchlist) - len(valid_results)
+    if not valid_results:
+        return "🐳 *WHALE SKEN TRHU*\n\nDnes zatím žádný výrazný pohyb."
+
+    by_money = sorted(valid_results, key=lambda x: abs(x["net_flow"]), reverse=True)[:5]
+    by_strength = sorted([r for r in valid_results if r["market_cap"] > 0],
+                         key=lambda x: abs(x["flow_strength"]), reverse=True)[:5]
+    by_score = sorted(valid_results, key=lambda x: abs(x["flow_score"]), reverse=True)[:5]
+
+    lines = ["📊 *WHALE SKEN TRHU*", "━━━━━━━━━━━━━━━━━━━━━━", "🐳 *BIGGEST MONEY* _(Největší objem)_"]
+    for r in by_money:
+        sign = "+" if r["net_flow"] > 0 else ""
+        lines.append(f"  • *{r['ticker'].ljust(5)}* {sign}{fmt_usd(r['net_flow'])}")
+    lines.extend(["", "🚀 *RELATIVE FLOW* _(Největší dopad)_"])
+    for r in by_strength:
+        sign = "+" if r["flow_strength"] > 0 else ""
+        lines.append(f"  • *{r['ticker'].ljust(5)}* {sign}{r['flow_strength']:.4f}%")
+    lines.extend(["━━━━━━━━━━━━━━━━━━━━━━", "🎯 *TOP SETUPY* _(Nejvyšší přesvědčení)_"])
+    if zero_count > 0:
+        lines.append(f"_(Skryto {zero_count} tickerů bez výrazné aktivity)_")
+    for r in by_score:
+        fs = r["flow_score"]
+        if fs >= 0.6: verdict = "🔥 VERY STRONG BULLISH"
+        elif fs >= 0.2: verdict = "🟢 BULLISH"
+        elif fs >= -0.2: verdict = "➡️ NEUTRAL"
+        elif fs >= -0.6: verdict = "🟠 BEARISH"
+        else: verdict = "🧊 STRONG BEARISH"
+        sign_flow = "+" if r["net_flow"] > 0 else ""
+        sign_fs = "+" if fs > 0 else ""
+        lines.append(
+            f"*{r['ticker']}*\n"
+            f" 💵 Net Flow: `{sign_flow}{fmt_usd(r['net_flow'])}`\n"
+            f" 🌡 FlowScore: `{sign_fs}{fs:.2f}`\n"
+            f" 📌 Verdikt: {verdict}\n"
+        )
+    await asyncio.to_thread(save_flow_history)
+    return "\n".join(lines)
+
+async def produce_nasdaq() -> str:
+    def analyze_for_nasdaq(ticker):
+        result = make_chart(ticker, "1d", False, False)
+        if not result: return None
+        _, _, data = result
+        if not data: return None
+        if "No Setup" in data["setup_type"]: return None
+        if data["score"] <= 0: return None
+        return {
+            "ticker": ticker,
+            "type": data["setup_type"].replace("🟢 ", "").replace("🚀 ", ""),
+            "score": data["score"], "sm": data["sm"], "entry": data["entry"],
+            "stop": f"${data['stop']:.2f}", "t1": f"${data['t1']:.2f}",
+            "rr": f"1:{data['rr_zone']:.1f}",
+        }
+    raw_results = await scan_universe(NASDAQ_100, analyze_for_nasdaq, delay=SCAN_DELAY_CHART)
+    valid_setups = [r for r in raw_results if r is not None]
+    valid_setups.sort(key=lambda x: x["score"], reverse=True)
+    top_10 = valid_setups[:10]
+    if not top_10:
+        return "❌ Nebyly nalezeny žádné validní setupy v NASDAQ-100."
+    lines = ["📊 *TOP 10 NASDAQ SETUPŮ*", "━━━━━━━━━━━━━━━━━━━━━━"]
+    for s in top_10:
+        lines.append(
+            f"*{s['ticker']}* | 🏆 Score: `{s['score']}` | SM: `{s['sm']}/8`\n"
+            f"🎯 Type: `{s['type']}` | ⚖️ R:R: `{s['rr']}`\n"
+            f"📍 Vstup: `{s['entry']}`\n"
+            f"🔴 Stop: `{s['stop']}` | 🟢 T1: `{s['t1']}`\n"
+        )
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💡 _Generováno automaticky_")
+    return "\n".join(lines)
+
+async def produce_darkhorse() -> str:
+    watchlist = load_russell_watchlist()
+    try:
+        await asyncio.to_thread(yf.download, "SPY", period="1d", progress=False)
+    except Exception:
+        pass
+    def scan_darkhorse(ticker):
+        result = make_chart(ticker, "1d", False, False)
+        if not result: return None
+        _, _, data = result
+        if not data: return None
+        if "No Setup" in data["setup_type"]: return None
+        score = data["score"]
+        if score < 70: return None
+        rr_zone = data["rr_zone"]
+        if rr_zone < 2.0: return None
+        sm_score = data["sm"]
+        mom_norm = 1.0 if data["mom_ok"] else 0.0
+        vol_norm = 1.0 if data["vol_ok"] else 0.0
+        score_norm = score / 100.0
+        rr_norm = min(rr_zone, 10.0) / 10.0
+        dh_score = (score_norm * 0.4 + rr_norm * 0.3 + mom_norm * 0.2 + vol_norm * 0.1) * 100
+        return {"ticker": ticker, "score": score, "sm": sm_score, "rr": rr_zone, "dh_score": dh_score}
+    raw_results = await scan_universe(watchlist, scan_darkhorse, delay=SCAN_DELAY_CHART)
+    valid_setups = [r for r in raw_results if r is not None]
+    valid_setups.sort(key=lambda x: x["dh_score"], reverse=True)
+    top_10 = valid_setups[:10]
+    if not top_10:
+        return "❌ Nebyly nalezeny žádné validní Dark Horse setupy (Score > 70, RR > 2)."
+    lines = ["🐎 *DARK HORSE SCAN (Russell 2000)*", "━━━━━━━━━━━━━━━━━━━━━━"]
+    for i, s in enumerate(top_10, 1):
+        lines.append(
+            f"*{i}. {s['ticker']}*\n"
+            f"🏆 Score: `{s['score']}` | SM: `{s['sm']}/8`\n"
+            f"⚖️ RR: `{s['rr']:.1f}R` | 🐎 DarkHorse: `{s['dh_score']:.0f}`\n"
+        )
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    return "\n".join(lines)
+
+
+# ── Callbacky: kontextová navigace + menu ────────────────────────────────────
+_NAV_LOADING = {
+    "profil": "🧭 Skládám profil",
+    "genius": "🧠 Počítám Genius",
+    "flow":   "🌊 Skenuji flow",
+    "news":   "📰 Stahuji zprávy",
+    "chart":  "📈 Generuji graf",
+    "edge":   "🔬 Backtestuji",
+}
+
+async def nav_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Zpracuje tlačítka 'nav:<akce>:<ticker>' pod výstupy."""
+    query = update.callback_query
+    try:
+        _, action, ticker = query.data.split(":")
+    except ValueError:
+        await query.answer()
+        return
+    await query.answer()
+    base = query.message
+    loading = await base.reply_text(
+        f"{_NAV_LOADING.get(action, '⏳ Pracuji na')} *{ticker}*...", parse_mode="Markdown")
+
+    if action == "chart":
+        try:
+            png, text, _ = await asyncio.wait_for(
+                asyncio.to_thread(make_chart, ticker, "1d"), timeout=30.0)
+        except Exception as e:
+            await loading.edit_text(f"❌ Chyba grafu: {e}")
+            return
+        if png is None:
+            await loading.edit_text(text)
+            return
+        try:
+            await loading.delete()
+        except Exception:
+            pass
+        try:
+            await base.reply_photo(photo=io.BytesIO(png),
+                                   caption=f"📈 *Graf {ticker}* (1d)", parse_mode="Markdown")
+        except Exception:
+            await base.reply_photo(photo=io.BytesIO(png), caption=f"Graf {ticker} (1d)")
+        await reply_long_with_kb(base, text, nav_keyboard(ticker, exclude="chart"))
+        return
+
+    if action == "news":
+        text, items = await produce_news(ticker)
+        if not text:
+            await loading.edit_text(f"❌ Žádné zprávy pro *{ticker}*.", parse_mode="Markdown")
+            return
+        await deliver_result(loading, base, text, news_keyboard(ticker))
+        return
+
+    if action == "profil":
+        text = await produce_profil(ticker)
+    elif action == "genius":
+        text = await produce_genius(ticker)
+    elif action == "flow":
+        text = await produce_flow_ticker(ticker)
+    elif action == "edge":
+        text = await produce_edge(ticker)
+    else:
+        text = "❓ Neznámá akce."
+    await deliver_result(loading, base, text, nav_keyboard(ticker, exclude=action))
+
+
+HOME_TEXT = (
+    "🧠 *AKCIOVÝ GENIUS 2.0*\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "Tvůj analytický parťák na akcie, opce i makro.\n\n"
+    "Napiš *ticker* (např. `AAPL`) pro graf + S/R úrovně,\n"
+    "nebo si vyber kategorii níže. Pod každým výstupem najdeš\n"
+    "tlačítka pro rychlé přepnutí analýzy. 👇"
+)
+
+MENU_TEXTS = {
+    "investor": (
+        "🧭 *INVESTOR — dlouhodobá analýza firmy*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "• `/profil AAPL` — investiční profil + fundamentální scorecard\n"
+        "   _(růst, ziskovost, rozvaha, valuace, cash flow + verdikt)_\n"
+        "• `/genius AAPL` — fúze techniky + flow + news do 1 přesvědčení\n"
+        "• `/edge AAPL` — backtest: historická úspěšnost setupů\n"
+        "• `/news AAPL` — nejnovější zprávy + AI sentiment"
+    ),
+    "flow": (
+        "🌊 *FLOW & WHALES — kam tečou velké peníze*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "• `/flow AAPL` — hloubkový opční flow tickeru (whale bloky, akumulace)\n"
+        "• `/flow` — plošný whale sken trhu (bez tickeru)\n"
+        "• `/akumulace` — strikes, co se nabalují víc dní po sobě\n"
+        "• `/whaleradar on` — 🐋 živý radar velkých opčních bloků"
+    ),
+    "chart": (
+        "📈 *GRAFY & SETUPY — technická analýza*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "• `AAPL` nebo `RKLB 4h` — graf + S/R úrovně\n"
+        "   _(TF: 1m,5m,15m,30m,1h,4h,1d,1wk,1mo)_\n"
+        "• `/smc ASTS` — Smart Money Concepts (Order Blocks, FVG, sweepy)\n"
+        "• `/sniper ASTS` — alert na zásah OB zóny _(vypnutí: `/sniper off ASTS`)_"
+    ),
+    "macro": (
+        "🌍 *MAKRO — celkový pohled na trh*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "• `/walter on` — makro market alerty z bleskového feedu\n"
+        "• `/ai` (s PDF) — tvrdý výtah z prezentace/reportu"
+    ),
+    "help": (
+        "❓ *KOMPLETNÍ NÁPOVĚDA*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "*Investor:* `/profil` · `/genius` · `/edge` · `/news`\n"
+        "*Flow:* `/flow` · `/akumulace` · `/whaleradar`\n"
+        "*Grafy:* _ticker_ · `/smc` · `/sniper`\n"
+        "*Skenery:* `/nasdaq` · `/darkhorse` · `/flow` (bez tickeru)\n"
+        "*Makro:* `/walter` · `/ai` (PDF)\n\n"
+        "💡 _Pod každým výstupem k tickeru máš tlačítka pro přepnutí analýzy._"
+    ),
+}
+
+def _menu_kb(screen: str) -> InlineKeyboardMarkup:
+    return scan_keyboard() if screen == "scan" else back_keyboard()
+
+async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Zpracuje tlačítka rozcestníku 'menu:*'."""
+    query = update.callback_query
+    data = query.data
+    await query.answer()
+
+    if data == "menu:home":
+        await query.edit_message_text(HOME_TEXT, parse_mode="Markdown", reply_markup=home_keyboard())
+        return
+
+    if data.startswith("menu:run:"):
+        what = data.split(":")[2]
+        loading = await query.message.reply_text("⏳ Spouštím sken trhu... _(může chvíli trvat)_",
+                                                 parse_mode="Markdown")
+        if what == "nasdaq":
+            text = await produce_nasdaq()
+        elif what == "whales":
+            text = await produce_whales_scan()
+        elif what == "darkhorse":
+            text = await produce_darkhorse()
+        else:
+            text = "❓ Neznámý sken."
+        await deliver_result(loading, query.message, text, None)
+        return
+
+    screen = data.split(":")[1]
+    if screen == "scan":
+        await query.edit_message_text(
+            "🔍 *SKENERY TRHU*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Klikni a spustím sken (běží na pozadí, výsledek pošlu jako novou zprávu):",
+            parse_mode="Markdown", reply_markup=scan_keyboard())
+        return
+    text = MENU_TEXTS.get(screen, HOME_TEXT)
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=_menu_kb(screen))
+
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 *Ahoj! Jsem tvůj analytický bot.*\n\n"
-        "Pošli mi ticker (např. `AAPL`) pro S/R úrovně a graf. Můžeš přidat i timeframe:\n"
-        "• `AAPL` – denní svíčky (1d)\n"
-        "• `RKLB 4h` – 4hodinové svíčky\n"
-        "• _Podporované TF: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1wk, 1mo_\n\n"
-        "🛠 *Další příkazy:*\n"
-        "📰 `/news ONDS` – Nejnovější zprávy\n"
-        "🌊 `/unusual AAPL` – Detekce velkých opčních obchodů (Whale activity)\n"
-        "🧭 `/profil AAPL` – Investiční profil + fundamentální scorecard firmy\n\n"
-        "ℹ️ Kompletní seznam příkazů: `/help`",
-        parse_mode="Markdown")
+    await update.message.reply_text(HOME_TEXT, parse_mode="Markdown", reply_markup=home_keyboard())
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *PŘEHLED PŘÍKAZŮ*\n"
+        "📖 *AKCIOVÝ GENIUS 2.0 — PŘEHLED PŘÍKAZŮ*\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "*📊 Grafy & setupy*\n"
+        "*🧭 Investor (akcie)*\n"
+        "• `/profil AAPL` – investiční profil + fundamentální scorecard\n"
+        "• `/genius AAPL` – fúze techniky + flow + news (0–100)\n"
+        "• `/edge AAPL` – backtest historické úspěšnosti setupů\n"
+        "• `/news AAPL` – zprávy + AI sentiment\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "*🌊 Flow & Whales*\n"
+        "• `/flow AAPL` – hloubkový opční flow tickeru (whale bloky, akumulace)\n"
+        "• `/flow` – plošný whale sken trhu (bez tickeru)\n"
+        "• `/akumulace` – 🧲 strikes, co se nabalují víc dní (volitelně `/akumulace PLTR`)\n"
+        "• `/whaleradar on` – 🐋 živý radar velkých opčních bloků\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "*📈 Grafy & setupy*\n"
         "• `AAPL` nebo `RKLB 4h` – graf + S/R úrovně (TF: 1m,5m,15m,30m,1h,4h,1d,1wk,1mo)\n"
         "• `/smc ASTS` – Smart Money Concepts (Order Blocks, FVG, sweepy)\n"
         "• `/sniper ASTS` – alert na zásah OB zóny (vypnutí: `/sniper off ASTS`)\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "*🧠 Genius Score & Edge*\n"
-        "• `/genius AAPL` – fúze techniky + flow + news do 1 přesvědčení (0–100)\n"
-        "• `/edge AAPL` – backtest: historická úspěšnost setupů (WR, expectancy)\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "*🧭 Investiční analýza*\n"
-        "• `/profil AAPL` – investiční profil + fundamentální scorecard (růst, ziskovost, rozvaha, valuace, cash flow)\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "*🔍 Skenery*\n"
+        "*🔍 Skenery & makro*\n"
         "• `/nasdaq` – TOP 10 setupů z NASDAQ-100\n"
         "• `/darkhorse` – skryté příležitosti z Russell 2000\n"
-        "• `/whales` – ranní whale-flow skener\n"
-        "• `/whaleradar on` – 🐋 živý radar velkých opčních bloků (celý trh)\n"
-        "• `/unusual AAPL` – neobvyklá opční aktivita (+ akumulace v čase)\n"
-        "• `/akumulace` – 🧲 strikes, co se nabalují víc dní (volitelně `/akumulace PLTR`)\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "*🤖 AI & fundament*\n"
-        "• `/news ONDS` – AI sentiment z nejnovějších zpráv\n"
+        "• `/walter` – makro market alerty\n"
         "• `/ai` (s PDF) – tvrdý výtah z prezentace/reportu\n"
-        "• `/walter` – makro market alerty",
-        parse_mode="Markdown")
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 _Tip: napiš `/start` pro proklikávací menu. Pod každým výstupem máš "
+        "tlačítka pro přepnutí analýzy na stejném tickeru._",
+        parse_mode="Markdown", reply_markup=home_keyboard())
 
 last_market_text = ""
 
@@ -2960,24 +3369,17 @@ async def news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         
     ticker = ctx.args[0].upper()
     msg = await update.message.reply_text(f"⏳ Stahuji zprávy pro {ticker} přes nezávislý RSS kanál...")
-    
-    items = await asyncio.to_thread(fetch_yahoo_rss, ticker)
-        
-    if not items:
+
+    text, items = await produce_news(ticker)
+    if not text:
         await msg.edit_text(f"❌ Žádné zprávy pro '{ticker}' (Nebo je špatný ticker).")
         return
 
-    lines = [f"📰 *POSLEDNÍ ZPRÁVY: {ticker}*", "━━━━━━━━━━━━━━━━━━━━━━"]
-    for item in items:
-        lines.append(f"🔹 *[{item['title']}]({item['link']})*\n")
-        
-    keyboard = [[InlineKeyboardButton("🧠 AI Analýza Zpráv", callback_data=f"ainews_{ticker}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
     try:
-        await msg.edit_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True, reply_markup=reply_markup)
+        await msg.edit_text(text, parse_mode="Markdown", disable_web_page_preview=True,
+                            reply_markup=news_keyboard(ticker))
     except Exception:
-        await msg.edit_text("\n".join(lines), disable_web_page_preview=True, reply_markup=reply_markup)
+        await msg.edit_text(text, disable_web_page_preview=True, reply_markup=news_keyboard(ticker))
 
 async def ai_news_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3017,201 +3419,47 @@ async def ai_news_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         final_text = f"📰 *AI SENTIMENT: {ticker}*\n━━━━━━━━━━━━━━━━━━━━━━\n{ai_out}"
-        await query.edit_message_text(final_text, parse_mode="Markdown")
-        
+        await query.edit_message_text(final_text, parse_mode="Markdown",
+                                      reply_markup=nav_keyboard(ticker, exclude="news"))
+
     except Exception as e:
         await query.edit_message_text(f"❌ Chyba AI analýzy: {str(e)}")
 
 async def nasdaq_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
         f"⏳ Spouštím masivní skener pro NASDAQ-100...\n"
-        f"Stahuji data a analyzuji {len(NASDAQ_100)} akcií. Může to trvat 1-2 minuty.", 
-        parse_mode="Markdown"
+        f"Stahuji data a analyzuji {len(NASDAQ_100)} akcií. Může to trvat 1-2 minuty.",
+        parse_mode="Markdown",
     )
-
-    def analyze_for_nasdaq(ticker):
-        result = make_chart(ticker, "1d", False, False)
-        if not result: return None
-        _, _, data = result
-        if not data: return None
-
-        if "No Setup" in data["setup_type"]: return None
-        if data["score"] <= 0: return None
-
-        return {
-            "ticker": ticker,
-            "type": data["setup_type"].replace("🟢 ", "").replace("🚀 ", ""),
-            "score": data["score"],
-            "sm": data["sm"],
-            "entry": data["entry"],
-            "stop": f"${data['stop']:.2f}",
-            "t1": f"${data['t1']:.2f}",
-            "rr": f"1:{data['rr_zone']:.1f}",
-        }
-
-    raw_results = await scan_universe(NASDAQ_100, analyze_for_nasdaq, delay=SCAN_DELAY_CHART)
-
-    valid_setups = [r for r in raw_results if r is not None]
-    valid_setups.sort(key=lambda x: x["score"], reverse=True)
-    top_10 = valid_setups[:10]
-
-    if not top_10:
-        await msg.edit_text("❌ Nebyly nalezeny žádné validní setupy v NASDAQ-100.")
-        return
-
-    lines = ["📊 *TOP 10 NASDAQ SETUPŮ*", "━━━━━━━━━━━━━━━━━━━━━━"]
-    for s in top_10:
-        lines.append(
-            f"*{s['ticker']}* | 🏆 Score: `{s['score']}` | SM: `{s['sm']}/8`\n"
-            f"🎯 Type: `{s['type']}` | ⚖️ R:R: `{s['rr']}`\n"
-            f"📍 Vstup: `{s['entry']}`\n"
-            f"🔴 Stop: `{s['stop']}` | 🟢 T1: `{s['t1']}`\n"
-        )
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("💡 _Generováno automaticky_")
-
-    try: await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-    except Exception: await msg.edit_text("\n".join(lines).replace("*", "").replace("`", ""))
+    text = await produce_nasdaq()
+    try: await msg.edit_text(text, parse_mode="Markdown")
+    except Exception: await msg.edit_text(text.replace("*", "").replace("`", ""))
 
 async def darkhorse_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    watchlist = load_russell_watchlist()
-    
     msg = await update.message.reply_text(
         f"⏳ *Skenuji temné koně trhu...*\n"
-        f"Analyzuji `{len(watchlist)}` akcií z Russell 2000.", 
-        parse_mode="Markdown"
+        f"Analyzuji akcie z Russell 2000.",
+        parse_mode="Markdown",
     )
-
-    try: await asyncio.to_thread(yf.download, "SPY", period="1d", progress=False)
-    except Exception: pass
-
-    def scan_darkhorse(ticker):
-        result = make_chart(ticker, "1d", False, False)
-        if not result: return None
-
-        _, _, data = result
-        if not data: return None
-        if "No Setup" in data["setup_type"]: return None
-
-        score = data["score"]
-        if score < 70: return None
-
-        rr_zone = data["rr_zone"]
-        if rr_zone < 2.0: return None
-
-        sm_score = data["sm"]
-        mom_norm = 1.0 if data["mom_ok"] else 0.0
-        vol_norm = 1.0 if data["vol_ok"] else 0.0
-
-        score_norm = score / 100.0
-        rr_norm = min(rr_zone, 10.0) / 10.0
-        dh_score = (score_norm * 0.4 + rr_norm * 0.3 + mom_norm * 0.2 + vol_norm * 0.1) * 100
-
-        return {"ticker": ticker, "score": score, "sm": sm_score, "rr": rr_zone, "dh_score": dh_score}
-
-    raw_results = await scan_universe(watchlist, scan_darkhorse, delay=SCAN_DELAY_CHART)
-
-    valid_setups = [r for r in raw_results if r is not None]
-    valid_setups.sort(key=lambda x: x["dh_score"], reverse=True)
-    top_10 = valid_setups[:10]
-
-    if not top_10:
-        await msg.edit_text("❌ Nebyly nalezeny žádné validní Dark Horse setupy (Score > 70, RR > 2).")
-        return
-
-    lines = ["🐎 *DARK HORSE SCAN (Russell 2000)*", "━━━━━━━━━━━━━━━━━━━━━━"]
-    for i, s in enumerate(top_10, 1):
-        lines.append(
-            f"*{i}. {s['ticker']}*\n"
-            f"🏆 Score: `{s['score']}` | SM: `{s['sm']}/8`\n"
-            f"⚖️ RR: `{s['rr']:.1f}R` | 🐎 DarkHorse: `{s['dh_score']:.0f}`\n"
-        )
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
-
-    try: await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-    except Exception: await msg.edit_text("\n".join(lines).replace("*", "").replace("`", ""))
-
-async def unusual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Použití: `/unusual AAPL`", parse_mode="Markdown")
-        return
-        
-    ticker = ctx.args[0].upper()
-    msg = await update.message.reply_text(f"⏳ Skenuji opční trh pro *{ticker}*...", parse_mode="Markdown")
-
-    try:
-        tk = yf.Ticker(ticker)
-        hist = await asyncio.wait_for(asyncio.to_thread(tk.history, period="1d"), timeout=30.0)
-        if hist.empty: raise ValueError(f"Nepodařilo se načíst tržní cenu pro {ticker}")
-            
-        current_price = float(hist["Close"].iloc[-1])
-        hits, market_cap = await asyncio.wait_for(asyncio.to_thread(analyze_options_flow, ticker, current_price), timeout=30.0)
-        text = format_unusual(ticker, hits, current_price, market_cap)
-        await asyncio.to_thread(save_flow_history)   # zapiš dnešní snapshot do paměti
-    except asyncio.TimeoutError:
-        text = f"❌ Skenování trvalo moc dlouho."
-    except Exception as e:
-        text = f"❌ Chyba: {e}"
-
+    text = await produce_darkhorse()
     try: await msg.edit_text(text, parse_mode="Markdown")
-    except Exception: await msg.edit_text(text)
+    except Exception: await msg.edit_text(text.replace("*", "").replace("`", ""))
 
-async def whales_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    watchlist = WHALE_SMALLCAPS
-
-    msg = await update.message.reply_text(
-        f"⏳ Spouštím ranní skener pro Whale Tracker ({len(watchlist)} tickerů)...", 
-        parse_mode="Markdown"
-    )
-
-    raw_results = await scan_universe(watchlist, get_net_whale_flow, delay=SCAN_DELAY_FLOW)
-
-    valid_results = [r for r in raw_results if r is not None and r["net_flow"] != 0]
-    zero_count = len(watchlist) - len(valid_results)
-
-    if not valid_results:
-        await msg.edit_text(f"🐳 *RANNÍ SKENER*\n\nDnes zatím žádný výrazný pohyb.", parse_mode="Markdown")
-        return
-
-    by_money = sorted(valid_results, key=lambda x: abs(x["net_flow"]), reverse=True)[:5]
-    by_strength = sorted([r for r in valid_results if r["market_cap"] > 0], key=lambda x: abs(x["flow_strength"]), reverse=True)[:5]
-    by_score = sorted(valid_results, key=lambda x: abs(x["flow_score"]), reverse=True)[:5]
-
-    lines = ["📊 *RANNÍ SKENER TRHU*", "━━━━━━━━━━━━━━━━━━━━━━", "🐳 *BIGGEST MONEY* _(Největší objem)_"]
-    for r in by_money:
-        sign = "+" if r["net_flow"] > 0 else ""
-        lines.append(f"  • *{r['ticker'].ljust(5)}* {sign}{fmt_usd(r['net_flow'])}")
-        
-    lines.extend(["", "🚀 *RELATIVE FLOW* _(Největší dopad)_"])
-    for r in by_strength:
-        sign = "+" if r["flow_strength"] > 0 else ""
-        lines.append(f"  • *{r['ticker'].ljust(5)}* {sign}{r['flow_strength']:.4f}%")
-
-    lines.extend(["━━━━━━━━━━━━━━━━━━━━━━", "🎯 *TOP SETUPY* _(Nejvyšší přesvědčení)_"])
-    if zero_count > 0:
-        lines.append(f"_(Skryto {zero_count} tickerů bez výrazné aktivity)_")
-    for r in by_score:
-        fs = r["flow_score"]
-        if fs >= 0.6: verdict = "🔥 VERY STRONG BULLISH"
-        elif fs >= 0.2: verdict = "🟢 BULLISH"
-        elif fs >= -0.2: verdict = "➡️ NEUTRAL"
-        elif fs >= -0.6: verdict = "🟠 BEARISH"
-        else: verdict = "🧊 STRONG BEARISH"
-        
-        sign_flow = "+" if r["net_flow"] > 0 else ""
-        sign_fs = "+" if fs > 0 else ""
-        
-        lines.append(
-            f"*{r['ticker']}*\n"
-            f" 💵 Net Flow: `{sign_flow}{fmt_usd(r['net_flow'])}`\n"
-            f" 🌡 FlowScore: `{sign_fs}{fs:.2f}`\n"
-            f" 📌 Verdikt: {verdict}\n"
+async def flow_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """🌊 Flow & Whales — s tickerem hloubkový opční flow, bez tickeru sken trhu.
+    Sloučení původních /unusual + /whales do jednoho příkazu."""
+    if ctx.args:
+        ticker = ctx.args[0].upper()
+        msg = await update.message.reply_text(f"⏳ Skenuji opční trh pro *{ticker}*...", parse_mode="Markdown")
+        text = await produce_flow_ticker(ticker)
+        await deliver_result(msg, update.message, text, nav_keyboard(ticker, exclude="flow"))
+    else:
+        msg = await update.message.reply_text(
+            f"⏳ Spouštím plošný whale sken ({len(WHALE_SMALLCAPS)} tickerů)...",
+            parse_mode="Markdown",
         )
-
-    await asyncio.to_thread(save_flow_history)   # sken naplnil flow paměť
-
-    try: await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-    except Exception: await msg.edit_text("\n".join(lines).replace("*", "").replace("_", "").replace("`", ""))
+        text = await produce_whales_scan()
+        await deliver_result(msg, update.message, text, None)
 
 async def akumulace_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Co se právě nabaluje: strikes s vícedenní akumulací napříč pamětí enginu.
@@ -3294,16 +3542,8 @@ async def earnings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ticker = ctx.args[0].upper()
     msg = await update.message.reply_text(f"⏳ Skládám investiční profil *{ticker}*...", parse_mode="Markdown")
-    
-    try:
-        text = await asyncio.wait_for(asyncio.to_thread(analyze_earnings, ticker), timeout=20.0)
-    except asyncio.TimeoutError:
-        text = f"❌ Vypršel časový limit (20s)."
-    except Exception as e:
-        text = f"❌ Při analýze nastala neočekávaná chyba: {e}"
-        
-    try: await msg.edit_text(text, parse_mode="Markdown")
-    except Exception: await msg.edit_text(text)
+    text = await produce_profil(ticker)
+    await deliver_result(msg, update.message, text, nav_keyboard(ticker, exclude="profil"))
 
 # Ticker = 1–6 písmen, volitelně přípona jako -USD (BTC-USD) nebo .B (BRK.B).
 _TICKER_RE = re.compile(r"^[A-Z]{1,6}([.\-][A-Z]{1,4})?$")
@@ -3350,6 +3590,9 @@ async def handle_ticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     short_caption = f"🎯 Technický setup pro *{ticker}* ({interval})"
     await reply_photo_with_text(update.message, png, text, short_caption)
+    await update.message.reply_text("↔️ _Přepnout analýzu na_ "
+                                    f"*{ticker}*:", parse_mode="Markdown",
+                                    reply_markup=nav_keyboard(ticker, exclude="chart"))
 
 async def genius_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """🧠 Genius Score — sloučí techniku, options flow a news do 1 přesvědčení."""
@@ -3362,18 +3605,8 @@ async def genius_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🧠 Skládám *Genius Score* pro *{ticker}* (technika + flow + news)...",
         parse_mode="Markdown",
     )
-
-    try:
-        r = await asyncio.wait_for(gather_genius(ticker), timeout=45.0)
-        text = format_genius(r)
-        await asyncio.to_thread(save_flow_history)   # flow lens zapsal dnešní snapshot
-    except asyncio.TimeoutError:
-        text = f"❌ Analýza *{ticker}* trvala moc dlouho."
-    except Exception as e:
-        text = f"❌ Chyba: {e}"
-
-    try: await msg.edit_text(text, parse_mode="Markdown")
-    except Exception: await msg.edit_text(text.replace("*", "").replace("`", "").replace("_", ""))
+    text = await produce_genius(ticker)
+    await deliver_result(msg, update.message, text, nav_keyboard(ticker, exclude="genius"))
 
 async def edge_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """🔬 Edge Lab — backtestuje úspěšnost setupů na historii (`/edge AAPL [roky]`)."""
@@ -3391,17 +3624,8 @@ async def edge_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🔬 Backtestuji setupy pro *{ticker}* na {years} letech historie... _(chvíli to trvá)_",
         parse_mode="Markdown",
     )
-
-    try:
-        report = await asyncio.wait_for(asyncio.to_thread(backtest_setups, ticker, years), timeout=90.0)
-        text = format_edge(report)
-    except asyncio.TimeoutError:
-        text = f"❌ Backtest *{ticker}* trval moc dlouho."
-    except Exception as e:
-        text = f"❌ Chyba: {e}"
-
-    try: await msg.edit_text(text, parse_mode="Markdown")
-    except Exception: await msg.edit_text(text.replace("*", "").replace("`", "").replace("_", ""))
+    text = await produce_edge(ticker, years)
+    await deliver_result(msg, update.message, text, nav_keyboard(ticker, exclude="edge"))
 
 async def ai_pdf_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -3523,17 +3747,18 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("news", news))
-    app.add_handler(CommandHandler("unusual", unusual))
+    app.add_handler(CommandHandler(["flow", "unusual", "whales"], flow_cmd))
     app.add_handler(CommandHandler(["genius", "g"], genius_cmd))
     app.add_handler(CommandHandler(["edge", "backtest"], edge_cmd))
     app.add_handler(CommandHandler(["profil", "investice", "earnings"], earnings_cmd))
     app.add_handler(CallbackQueryHandler(ai_news_callback, pattern="^ainews_"))
+    app.add_handler(CallbackQueryHandler(nav_callback, pattern="^nav:"))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu:"))
     app.add_handler(CommandHandler("nasdaq", nasdaq_cmd))
     app.add_handler(CommandHandler("walter", cmd_walter))
     app.add_handler(CommandHandler("smc", smc_cmd))
     app.add_handler(CommandHandler("sniper", sniper_cmd))
     app.add_handler(CommandHandler("darkhorse", darkhorse_cmd))
-    app.add_handler(CommandHandler("whales", whales_cmd))
     app.add_handler(CommandHandler(["akumulace", "accumulation"], akumulace_cmd))
     app.add_handler(CommandHandler("whaleradar", whaleradar_cmd))
     app.add_handler(CommandHandler("ai", ai_pdf_cmd))
