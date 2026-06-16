@@ -2628,7 +2628,10 @@ HOME_TEXT = (
     "Tvůj analytický parťák na akcie, opce i makro.\n\n"
     "Napiš *ticker* (např. `AAPL`) pro graf + S/R úrovně,\n"
     "nebo si vyber kategorii níže. Pod každým výstupem najdeš\n"
-    "tlačítka pro rychlé přepnutí analýzy. 👇"
+    "tlačítka pro rychlé přepnutí analýzy. 👇\n\n"
+    "🤖 *Novinka:* `/agent on` — autonomní AI analytik, co sám "
+    "skenuje trh a pošle ti jen TOP příležitosti s tezí. "
+    "Svůj track record ukáže `/genius_score`."
 )
 
 MENU_TEXTS = {
@@ -2639,7 +2642,11 @@ MENU_TEXTS = {
         "   _(růst, ziskovost, rozvaha, valuace, cash flow + verdikt)_\n"
         "• `/genius AAPL` — fúze techniky + flow + news do 1 přesvědčení\n"
         "• `/edge AAPL` — backtest: historická úspěšnost setupů\n"
-        "• `/news AAPL` — nejnovější zprávy + AI sentiment"
+        "• `/news AAPL` — nejnovější zprávy + AI sentiment\n\n"
+        "🤖 *GENIUS AGENT* — autonomní lov\n"
+        "• `/agent on` — bot sám skenuje trh a pošle TOP picky s tezí\n"
+        "• `/agent now` — spustit lov hned\n"
+        "• `/genius_score` — reálná výsledkovka agenta"
     ),
     "flow": (
         "🌊 *FLOW & WHALES — kam tečou velké peníze*\n"
@@ -2714,6 +2721,475 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=_menu_kb(screen))
 
 
+# ==============================================================================
+# 3d. GENIUS AGENT — autonomní lov nejlepších příležitostí + výsledkovka
+# ==============================================================================
+# Dvoufázový trychtýř:
+#   1) PRESCREEN: levný technický sken celého revíru (make_chart, flow=False) →
+#      shortlist nejsilnějších setupů.
+#   2) HLOUBKA: jen na shortlistu pustí plnou fúzi (gather_genius: technika+flow+
+#      news+earnings) a Edge backtest (backtest_setups) → reálná historická
+#      úspěšnost JEHO setupu. Z toho se spočítá Agent Conviction a projdou jen
+#      picky nad prahem (max 3). Každý pick se zaloguje pro výsledkovku.
+
+AGENT_FILE = "genius_agent.json"            # odběratelé (chat_id)
+AGENT_PICKS_FILE = "genius_picks.json"      # log picků pro výsledkovku
+AGENT_MIN_CONVICTION = int(os.getenv("AGENT_MIN_CONVICTION", "68"))
+AGENT_MAX_PICKS = int(os.getenv("AGENT_MAX_PICKS", "3"))
+AGENT_PRESCREEN_SCORE = int(os.getenv("AGENT_PRESCREEN_SCORE", "60"))
+AGENT_SHORTLIST = int(os.getenv("AGENT_SHORTLIST", "12"))
+AGENT_DH_CHUNK = int(os.getenv("AGENT_DH_CHUNK", "50"))      # rotující dávka Russellu / cyklus
+AGENT_INTERVAL = int(os.getenv("AGENT_INTERVAL", "7200"))   # intraday cyklus (s) = 2 h
+AGENT_EVAL_INTERVAL = int(os.getenv("AGENT_EVAL_INTERVAL", "3600"))  # vyhodnocení picků
+AGENT_PICK_MAX_HOLD = int(os.getenv("AGENT_PICK_MAX_HOLD", "20"))    # dní na vyřešení picku
+AGENT_DEDUP_HOURS = int(os.getenv("AGENT_DEDUP_HOURS", "20"))        # stejný ticker neopakovat dřív
+
+agent_chats: set = set()        # odběratelé — naplní se v main()
+_agent_seen: dict = {}          # {ticker: ISO ts posledního odeslání} — dedup
+_agent_dh_idx = 0               # rotující ukazatel do Russell univerza
+_agent_run_lock = asyncio.Lock()
+
+# ── Perzistence ───────────────────────────────────────────────────────────────
+def load_agent_chats() -> set:
+    try:
+        with open(AGENT_FILE, "r", encoding="utf-8") as f:
+            return {int(x) for x in json.load(f)}
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        log.error("Chyba při načítání agent odběrů: %s", e)
+        return set()
+
+def save_agent_chats() -> None:
+    try:
+        with open(AGENT_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(agent_chats), f)
+    except Exception as e:
+        log.error("Nepodařilo se uložit agent odběry: %s", e)
+
+def load_agent_picks() -> list:
+    try:
+        with open(AGENT_PICKS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log.error("Chyba při načítání agent picků: %s", e)
+        return []
+
+def save_agent_picks(picks: list) -> None:
+    try:
+        with open(AGENT_PICKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(picks, f, ensure_ascii=False)
+    except Exception as e:
+        log.error("Nepodařilo se uložit agent picky: %s", e)
+
+# ── Univerzum & prescreen ─────────────────────────────────────────────────────
+def _agent_universe() -> list:
+    """Likvidní jádro (NASDAQ-100 + smallcapy) vždy celé + rotující dávka Russellu."""
+    global _agent_dh_idx
+    core = list(WHALE_UNIVERSE)
+    russ = load_russell_watchlist()
+    chunk = []
+    if russ:
+        start = _agent_dh_idx % len(russ)
+        chunk = russ[start:start + AGENT_DH_CHUNK]
+        if len(chunk) < AGENT_DH_CHUNK:
+            chunk += russ[:AGENT_DH_CHUNK - len(chunk)]
+        _agent_dh_idx = (start + AGENT_DH_CHUNK) % len(russ)
+    return list(dict.fromkeys(core + chunk))
+
+def _agent_prescreen(ticker: str):
+    """Levný technický filtr (jen tech, bez flow/render). Vrátí kandidáta nebo None."""
+    result = make_chart(ticker, "1d", False, False)
+    if not result:
+        return None
+    _, _, data = result
+    if not data:
+        return None
+    st = data.get("setup_type", "")
+    if "No Setup" in st:
+        return None
+    if data.get("score", 0) < AGENT_PRESCREEN_SCORE:
+        return None
+    return {"ticker": ticker, "score": data["score"], "setup_type": st}
+
+# ── Conviction model ──────────────────────────────────────────────────────────
+def _agent_build_pick(g: dict, edge: dict | None) -> dict | None:
+    """Z fúze (gather_genius) + Edge reportu spočítá Agent Conviction a sbalí pick."""
+    tech = g.get("tech")
+    if not tech:
+        return None
+    tk = g.get("ticker")
+    setup_type = tech.get("setup_type", "")
+    direction = g.get("direction", "")
+    bullish = "BULLISH" in direction
+    base = int(g.get("score", 0))
+    last = g.get("last") or tech.get("last")
+
+    wr = n = exp_r = years = None
+    if edge and not edge.get("insufficient") and edge.get("by_setup"):
+        years = edge.get("years")
+        bs = edge["by_setup"].get(setup_type)
+        if bs:
+            wr, n, exp_r = bs.get("wr"), bs.get("n", 0), bs.get("exp_r")
+
+    # EDGE GATE: s historickým vzorkem blenduj, bez něj strop 70.
+    if wr is not None and n >= EDGE_MIN_SAMPLE:
+        conviction = round(0.6 * base + 0.4 * wr * 100)
+        edge_ok = True
+    else:
+        conviction = min(base, 70)
+        edge_ok = False
+
+    if g.get("agree"):
+        conviction += 4
+    if g.get("conflict"):
+        conviction -= 10
+    ed = g.get("earn_days")
+    earn_soon = ed is not None and 0 <= ed <= GENIUS_EARN_RISK_DAYS
+    if earn_soon:
+        conviction = round(conviction * 0.88)
+    conviction = max(0, min(100, conviction))
+
+    return {
+        "ticker": tk, "setup_type": setup_type, "direction": direction, "bullish": bullish,
+        "base": base, "conviction": conviction, "last": last,
+        "entry": tech.get("entry"), "entry_bot": tech.get("entry_bot"), "entry_top": tech.get("entry_top"),
+        "stop": tech.get("stop"), "t1": tech.get("t1"), "t2": tech.get("t2"), "rr_zone": tech.get("rr_zone"),
+        "wr": wr, "n": n, "exp_r": exp_r, "years": years, "edge_ok": edge_ok,
+        "agree": g.get("agree"), "conflict": g.get("conflict"),
+        "earn_days": ed, "earn_soon": earn_soon,
+        "pro": g.get("pro", []), "risk": g.get("risk", []),
+    }
+
+async def _agent_scan(manual: bool = False) -> list:
+    """Spustí celý trychtýř a vrátí TOP picky (bez odeslání). Nepouští dva běhy naráz."""
+    async with _agent_run_lock:
+        universe = await asyncio.to_thread(_agent_universe)
+        pre = await scan_universe(universe, _agent_prescreen, delay=SCAN_DELAY_CHART)
+        cands = sorted([c for c in pre if c], key=lambda x: x["score"], reverse=True)[:AGENT_SHORTLIST]
+        if not cands:
+            return []
+
+        sem = asyncio.Semaphore(3)
+        async def deep(c):
+            tk = c["ticker"]
+            async with sem:
+                try:
+                    g = await asyncio.wait_for(gather_genius(tk), timeout=60.0)
+                except Exception as e:
+                    log.debug("[AGENT] fúze %s chyba: %s", tk, e)
+                    return None
+                if not g or not g.get("tech"):
+                    return None
+                try:
+                    edge = await asyncio.wait_for(
+                        asyncio.to_thread(backtest_setups, tk, EDGE_DEFAULT_YEARS), timeout=90.0)
+                except Exception as e:
+                    log.debug("[AGENT] edge %s chyba: %s", tk, e)
+                    edge = None
+                return _agent_build_pick(g, edge)
+
+        built = await asyncio.gather(*[deep(c) for c in cands])
+        picks = [p for p in built if p and p["bullish"] and p["conviction"] >= AGENT_MIN_CONVICTION]
+        picks.sort(key=lambda x: x["conviction"], reverse=True)
+        await asyncio.to_thread(save_flow_history)
+        return picks[:AGENT_MAX_PICKS]
+
+# ── Teze (grounded LLM) + formát karty ────────────────────────────────────────
+def _conv_bar(score: int) -> str:
+    filled = max(0, min(10, round(score / 10)))
+    return "▰" * filled + "▱" * (10 - filled)
+
+async def _agent_thesis(p: dict) -> str:
+    """LLM jen narativně poskládá tezi z DODANÝCH čísel. Fallback bez LLM."""
+    if p["edge_ok"]:
+        edge_line = (f"Historická úspěšnost setupu {p['setup_type']}: "
+                     f"{p['wr'] * 100:.0f} % z {p['n']} obchodů za {p['years']} let "
+                     f"(expectancy {p['exp_r']:+.2f}R).")
+    else:
+        edge_line = f"Setup {p['setup_type']} zatím nemá dost historických obchodů pro spolehlivý edge."
+    earn = (f"Earnings za {p['earn_days']} dní (binární riziko)." if p["earn_soon"]
+            else "Žádné earnings v dohledné době.")
+    last = p["last"]
+    lastfmt = f"${last:.2f}" if isinstance(last, (int, float)) else "N/A"
+    pros = "; ".join(p["pro"][:4]) or "Technický setup s příznivým poměrem zisk/riziko."
+    risks = "; ".join(p["risk"][:3]) or "Standardní tržní riziko."
+
+    brief = (
+        f"Ticker: {p['ticker']}\n"
+        f"Aktuální cena: {lastfmt}\n"
+        f"Setup: {p['setup_type']} ({p['direction']})\n"
+        f"Vstupní zóna: {p['entry']}\n"
+        f"Stop: {p['stop']} | Cíl 1: {p['t1']} | Cíl 2: {p['t2']} | R:R v zóně: 1:{p['rr_zone']}\n"
+        f"Genius conviction: {p['base']}/100; shoda techniky a flow: {p['agree']}\n"
+        f"{edge_line}\n"
+        f"Pro-argumenty: {pros}\n"
+        f"Rizika: {risks}\n"
+        f"{earn}\n"
+        f"Finální Agent conviction: {p['conviction']}/100"
+    )
+    prompt = (
+        "Jsi disciplinovaný obchodní analytik. Na základě VÝHRADNĚ těchto faktů napiš "
+        "stručnou českou tezi (3–4 věty), proč je to teď příležitost, a zakonči přesně "
+        "jednou větou začínající '⚠️ Klíčové riziko:'. Nevymýšlej ŽÁDNÁ nová čísla, používej "
+        "jen dodaná. Bez pozdravu, bez disclaimeru, bez investičního doporučení.\n\n"
+        f"FAKTA:\n{brief}"
+    )
+    out = await ask_groq(prompt, temperature=0.3, model=GROQ_MODEL)
+    if out and out.strip():
+        return out.strip()
+    return f"{pros}. {edge_line}\n⚠️ Klíčové riziko: {risks}."
+
+def _p(x) -> str:
+    return f"${x:.2f}" if isinstance(x, (int, float)) else "N/A"
+
+def format_agent_pick(p: dict, rank: int, thesis: str) -> str:
+    if p["edge_ok"]:
+        edge_str = (f"📈 Úspěšnost setupu: *{p['wr'] * 100:.0f} %* "
+                    f"_(n={p['n']}, {p['years']} let, exp {p['exp_r']:+.2f}R)_")
+    else:
+        edge_str = "📈 Úspěšnost setupu: _bez dostatečného historického vzorku_"
+    lines = [
+        f"*#{rank}  {p['ticker']}* — {p['direction']}",
+        f"🧠 Agent conviction: *{p['conviction']}/100*  {_conv_bar(p['conviction'])}",
+        f"🎯 Setup: `{p['setup_type']}`  ·  cena {_p(p['last'])}",
+        "",
+        thesis,
+        "",
+        "📋 *Plán obchodu*",
+        f"📍 Vstup: `{p['entry']}`",
+        f"🔴 Stop: `{_p(p['stop'])}`  ·  🟢 Cíl 1: `{_p(p['t1'])}`  ·  🟢 Cíl 2: `{_p(p['t2'])}`",
+        f"⚖️ R:R v zóně: `1:{p['rr_zone']:.1f}`" if isinstance(p["rr_zone"], (int, float)) else "",
+        edge_str,
+    ]
+    if p["earn_soon"]:
+        lines.append(f"⚠️ _Earnings za {p['earn_days']} d — zvaž velikost pozice._")
+    return "\n".join(l for l in lines if l != "")
+
+# ── Výsledkovka: logování a vyhodnocení picků ────────────────────────────────
+def _agent_log_pick(p: dict) -> None:
+    picks = load_agent_picks()
+    now = datetime.now(timezone.utc)
+    picks.append({
+        "id": f"{p['ticker']}-{now.strftime('%Y%m%d%H%M%S')}",
+        "ticker": p["ticker"], "ts": now.isoformat(),
+        "setup": p["setup_type"], "direction": p["direction"],
+        "entry_ref": p["last"], "stop": p["stop"], "t1": p["t1"], "t2": p["t2"],
+        "conviction": p["conviction"], "wr": p["wr"], "n": p["n"],
+        "status": "open", "result": None, "ret_pct": None, "closed_ts": None,
+    })
+    save_agent_picks(picks)
+
+def _agent_eval_one(rec: dict) -> dict | None:
+    """Vyhodnotí jeden otevřený pick proti reálnému vývoji ceny. None = stále otevřený."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    entry, stop, t1 = rec.get("entry_ref"), rec.get("stop"), rec.get("t1")
+    if not (entry and stop and t1) or entry <= 0:
+        return {"status": "void", "result": "void", "ret_pct": None, "closed_ts": now_iso}
+    try:
+        start_date = datetime.fromisoformat(rec["ts"]).date().isoformat()
+        hist = yf.Ticker(rec["ticker"]).history(start=start_date)
+    except Exception:
+        return None
+    if hist is None or hist.empty:
+        return None
+    highs, lows, closes = hist["High"].tolist(), hist["Low"].tolist(), hist["Close"].tolist()
+    bars = len(highs)
+    for j in range(bars):
+        if lows[j] <= stop:   # konzervativně: stop má přednost před cílem ve stejné svíčce
+            return {"status": "stop", "result": "stop",
+                    "ret_pct": (stop / entry - 1) * 100, "closed_ts": now_iso}
+        if highs[j] >= t1:
+            return {"status": "target", "result": "target",
+                    "ret_pct": (t1 / entry - 1) * 100, "closed_ts": now_iso}
+    if bars >= AGENT_PICK_MAX_HOLD:
+        return {"status": "timeout", "result": "timeout",
+                "ret_pct": (closes[-1] / entry - 1) * 100, "closed_ts": now_iso}
+    return None
+
+async def agent_eval_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pravidelně dovyhodnotí otevřené picky proti ceně (cíl/stop/timeout)."""
+    picks = await asyncio.to_thread(load_agent_picks)
+    open_picks = [p for p in picks if p.get("status") == "open"]
+    if not open_picks:
+        return
+    changed = False
+    for rec in open_picks:
+        res = await asyncio.to_thread(_agent_eval_one, rec)
+        if res:
+            rec.update(res)
+            changed = True
+    if changed:
+        await asyncio.to_thread(save_agent_picks, picks)
+
+# ── Odeslání picků + orchestrace běhu ────────────────────────────────────────
+async def _agent_send_card(bot, chat_id: int, text: str, keyboard) -> None:
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown",
+                               reply_markup=keyboard, disable_web_page_preview=True)
+    except Exception:
+        try:
+            await bot.send_message(chat_id=chat_id,
+                                   text=text.replace("*", "").replace("`", "").replace("_", ""),
+                                   reply_markup=keyboard)
+        except Exception as e:
+            log.error("[AGENT] odeslání karty selhalo: %s", e)
+
+async def _agent_deliver(bot, chat_ids: list, picks: list, manual: bool) -> None:
+    """Pošle hlavičku + karty picků do daných chatů. Loguje picky jednou (pro výsledkovku)."""
+    session = us_market_session()
+    sess_lbl = {"pre": "před US open", "regular": "US trh otevřený",
+                "after": "after-hours", "closed": "US trh zavřený"}.get(session, "")
+    header = (f"🧠 *GENIUS AGENT*  _( {sess_lbl} )_\n"
+              f"━━━━━━━━━━━━━━━━━━━━━━\n"
+              f"Dnes mám pro tebe *{len(picks)}* "
+              f"{'příležitost' if len(picks) == 1 else 'příležitosti' if len(picks) < 5 else 'příležitostí'}. "
+              f"Pořadí podle přesvědčení 👇")
+    # Teze paralelně (LLM), karty sériově kvůli pořadí.
+    theses = await asyncio.gather(*[_agent_thesis(p) for p in picks])
+    for chat_id in chat_ids:
+        try:
+            await bot.send_message(chat_id=chat_id, text=header, parse_mode="Markdown")
+        except Exception:
+            pass
+        for i, p in enumerate(picks, 1):
+            card = format_agent_pick(p, i, theses[i - 1])
+            await _agent_send_card(bot, chat_id, card, nav_keyboard(p["ticker"]))
+    # Výsledkovka: zaloguj každý pick jednou (ne per-chat).
+    for p in picks:
+        await asyncio.to_thread(_agent_log_pick, p)
+        _agent_seen[p["ticker"]] = datetime.now(timezone.utc).isoformat()
+
+def _agent_dedup_filter(picks: list) -> list:
+    """Vyřadí tickery odeslané během posledních AGENT_DEDUP_HOURS hodin."""
+    out = []
+    now = datetime.now(timezone.utc)
+    for p in picks:
+        ts = _agent_seen.get(p["ticker"])
+        if ts:
+            try:
+                age_h = (now - datetime.fromisoformat(ts)).total_seconds() / 3600
+                if age_h < AGENT_DEDUP_HOURS:
+                    continue
+            except Exception:
+                pass
+        out.append(p)
+    return out
+
+async def agent_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Automatický intraday běh: skenuje za tržních hodin a posílá odběratelům."""
+    if not agent_chats:
+        return
+    if us_market_session() == "closed":
+        return
+    try:
+        picks = await _agent_scan()
+    except Exception as e:
+        log.error("[AGENT] sken selhal: %s", e)
+        return
+    picks = _agent_dedup_filter(picks)
+    if not picks:
+        return  # automaticky mlčíme, když nic neprojde branou (žádný spam)
+    await _agent_deliver(context.bot, list(agent_chats), picks, manual=False)
+
+async def agent_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/agent on|off|now|status — autonomní lov příležitostí."""
+    chat_id = update.effective_chat.id
+    arg = ctx.args[0].lower() if ctx.args else "status"
+
+    if arg == "on":
+        agent_chats.add(chat_id)
+        save_agent_chats()
+        await update.message.reply_text(
+            "🤖 *GENIUS AGENT ZAPNUT*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Skenuji trh každé ~{AGENT_INTERVAL // 3600} h (jen za US tržních hodin) a pošlu ti "
+            f"jen TOP {AGENT_MAX_PICKS} setupy nad prahem přesvědčení *{AGENT_MIN_CONVICTION}/100* — "
+            "s plnou tezí, plánem obchodu a historickou úspěšností setupu.\n\n"
+            "• `/agent now` – spustit lov hned\n"
+            "• `/genius_score` – výsledkovka agenta\n"
+            "• `/agent off` – vypnout",
+            parse_mode="Markdown")
+    elif arg == "off":
+        agent_chats.discard(chat_id)
+        save_agent_chats()
+        await update.message.reply_text("🔕 *Genius Agent vypnut.*", parse_mode="Markdown")
+    elif arg == "now":
+        loading = await update.message.reply_text(
+            "🤖 _Spouštím lov... skenuji revír, fúzuji signály a validuju Edgem. "
+            "Chvíli to potrvá._", parse_mode="Markdown")
+        try:
+            picks = await _agent_scan(manual=True)
+        except Exception as e:
+            await loading.edit_text(f"❌ Agent selhal: {e}")
+            return
+        if not picks:
+            await loading.edit_text(
+                "🧠 *GENIUS AGENT*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                "Dnes nic nestojí za upozornění — trh bez jasných setupů nad prahem. "
+                "Radši mlčím, než abych tě zahltil šumem.", parse_mode="Markdown")
+            return
+        try:
+            await loading.delete()
+        except Exception:
+            pass
+        await _agent_deliver(ctx.bot, [chat_id], picks, manual=True)
+    else:
+        stav = "🟢 ZAPNUTÝ" if chat_id in agent_chats else "🔴 VYPNUTÝ"
+        await update.message.reply_text(
+            f"🤖 *Genius Agent:* {stav}\n"
+            "Použij `/agent on`, `/agent off`, `/agent now` nebo `/genius_score`.",
+            parse_mode="Markdown")
+
+async def genius_score_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/genius_score — reálný track record agenta z uzavřených picků."""
+    picks = await asyncio.to_thread(load_agent_picks)
+    if not picks:
+        await update.message.reply_text(
+            "🎯 *VÝSLEDKOVKA AGENTA*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Agent zatím nevydal žádný pick. Zapni ho přes `/agent on` nebo spusť `/agent now`.",
+            parse_mode="Markdown")
+        return
+    closed = [p for p in picks if p.get("status") in ("target", "stop", "timeout")]
+    open_picks = [p for p in picks if p.get("status") == "open"]
+    n = len(closed)
+    lines = ["🎯 *VÝSLEDKOVKA AGENTA*", "━━━━━━━━━━━━━━━━━━━━━━"]
+    if n:
+        wins = [p for p in closed if (p.get("ret_pct") or 0) > 0]
+        rets = [p.get("ret_pct") or 0 for p in closed]
+        wr = len(wins) / n * 100
+        avg = sum(rets) / n
+        avg_win = sum(r for r in rets if r > 0) / max(1, len(wins))
+        losers = [r for r in rets if r <= 0]
+        avg_loss = sum(losers) / max(1, len(losers))
+        targets = sum(1 for p in closed if p["status"] == "target")
+        stops = sum(1 for p in closed if p["status"] == "stop")
+        timeouts = sum(1 for p in closed if p["status"] == "timeout")
+        best = max(closed, key=lambda p: p.get("ret_pct") or -999)
+        worst = min(closed, key=lambda p: p.get("ret_pct") or 999)
+        lines += [
+            f"📊 Uzavřených picků: *{n}*  ·  otevřených: *{len(open_picks)}*",
+            f"✅ Win-rate: *{wr:.0f} %*  ({len(wins)}/{n})",
+            f"💰 Ø výsledek: *{avg:+.1f} %*  (Ø zisk {avg_win:+.1f} % / Ø ztráta {avg_loss:+.1f} %)",
+            f"🎯 Cíl: `{targets}`  ·  🔴 Stop: `{stops}`  ·  ⏳ Timeout: `{timeouts}`",
+            f"🏆 Nej: *{best['ticker']}* {best.get('ret_pct', 0):+.1f} %  ·  "
+            f"💩 Nej-: *{worst['ticker']}* {worst.get('ret_pct', 0):+.1f} %",
+        ]
+    else:
+        lines.append(f"📊 Zatím *0* uzavřených picků  ·  otevřených: *{len(open_picks)}*")
+        lines.append("_Výsledky se objeví, jakmile picky zasáhnou cíl/stop nebo vyprší._")
+    if open_picks:
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("📂 *Otevřené picky*")
+        for p in sorted(open_picks, key=lambda x: x.get("ts", ""), reverse=True)[:6]:
+            d = (p.get("ts") or "")[:10]
+            lines.append(f"  • *{p['ticker']}* `{p.get('setup', '')}` "
+                         f"(conv {p.get('conviction', '?')}, {d})")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HOME_TEXT, parse_mode="Markdown", reply_markup=home_keyboard())
 
@@ -2743,6 +3219,11 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• `/darkhorse` – skryté příležitosti z Russell 2000\n"
         "• `/walter` – makro market alerty\n"
         "• `/ai` (s PDF) – tvrdý výtah z prezentace/reportu\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "*🤖 Genius Agent (autonomní lov)*\n"
+        "• `/agent on` – bot sám skenuje trh a posílá TOP picky s tezí\n"
+        "• `/agent now` – spustit lov hned  ·  `/agent off` – vypnout\n"
+        "• `/genius_score` – reálná výsledkovka agenta (win-rate, Ø zisk)\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "💡 _Tip: napiš `/start` pro proklikávací menu. Pod každým výstupem máš "
         "tlačítka pro přepnutí analýzy na stejném tickeru._",
@@ -3727,7 +4208,7 @@ def main():
         return
 
     # Obnov aktivní snipery z minulého běhu
-    global active_snipers, whale_radar_chats
+    global active_snipers, whale_radar_chats, agent_chats
     active_snipers = load_snipers()
     if active_snipers:
         log.info("Obnoveno %d chatů s aktivními snipery.", len(active_snipers))
@@ -3736,6 +4217,11 @@ def main():
     whale_radar_chats = load_whale_chats()
     if whale_radar_chats:
         log.info("Obnoveno %d chatů s aktivním Whale Radarem.", len(whale_radar_chats))
+
+    # Obnov odběratele Genius Agenta
+    agent_chats = load_agent_chats()
+    if agent_chats:
+        log.info("Obnoveno %d chatů s aktivním Genius Agentem.", len(agent_chats))
 
     # Obnov flow paměť (akumulace/distribuce) z minulého běhu
     load_flow_history()
@@ -3761,6 +4247,8 @@ def main():
     app.add_handler(CommandHandler("darkhorse", darkhorse_cmd))
     app.add_handler(CommandHandler(["akumulace", "accumulation"], akumulace_cmd))
     app.add_handler(CommandHandler("whaleradar", whaleradar_cmd))
+    app.add_handler(CommandHandler("agent", agent_cmd))
+    app.add_handler(CommandHandler(["genius_score", "skore", "vysledkovka"], genius_score_cmd))
     app.add_handler(CommandHandler("ai", ai_pdf_cmd))
     app.add_handler(MessageHandler(filters.Document.PDF & filters.CaptionRegex(r'^/ai'), ai_pdf_cmd))
 
@@ -3774,6 +4262,8 @@ def main():
         app.job_queue.run_repeating(sniper_background_task, interval=60, first=15, name="sniper_job")
         app.job_queue.run_repeating(whale_radar_loop, interval=WHALE_RADAR_INTERVAL, first=30, name="whale_radar_job")
         app.job_queue.run_repeating(flow_history_flush_job, interval=120, first=120, name="flow_flush_job")
+        app.job_queue.run_repeating(agent_intraday_job, interval=AGENT_INTERVAL, first=90, name="agent_job")
+        app.job_queue.run_repeating(agent_eval_job, interval=AGENT_EVAL_INTERVAL, first=300, name="agent_eval_job")
     else:
         log.warning("JobQueue není dostupná – SMC Sniper poběží jen po /sniper. Nainstaluj python-telegram-bot[job-queue].")
 

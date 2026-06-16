@@ -16,6 +16,8 @@ walter_seen.json
 whale_radar.json
 flow_history.json
 flow_history.json.tmp
+genius_agent.json
+genius_picks.json
 posledni_tweet.txt
 
 # Cache / databáze
