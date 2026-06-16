@@ -909,16 +909,22 @@ def make_chart(ticker: str, interval: str = "1d", render: bool = True, flow: boo
     pullback_risk = res["pullback_risk"]
     dist_to_zone_pct = res["dist_to_zone_pct"]
 
-    # ── Entry plan (žebřík limitek) — jen u obchodovatelného setupu ───────────
+    # ── Entry plan (žebřík limitek) ───────────────────────────────────────────
+    # Ukáže se u každého setupu s definovanou zónou (tj. krom „No Setup"). Když
+    # je setup slabý (VYHNOUT/PROPADLO), přidá varování — žebřík je pak jen
+    # orientační „kde by vstup byl", ne doporučení k nákupu.
     ladder = None
     entry_plan_lines: list[str] = []
-    show_ladder = (setup_type != "⚠️ No Setup"
-                   and "VYHNOUT" not in status and "PROPADLO" not in status)
-    if show_ladder:
+    has_zone = setup_type != "⚠️ No Setup" and best_zone_top > best_zone_bot
+    weak_setup = ("VYHNOUT" in status or "PROPADLO" in status)
+    if has_zone:
         ladder = build_entry_ladder(best_zone_bot, best_zone_top, last, atr,
                                     stop_loss, target1, target2)
         num_emoji = ["1️⃣", "2️⃣", "3️⃣"]
-        entry_plan_lines = ["━━━━━━━━━━━━━━━━━━━━━━", "📋 *ENTRY PLAN (žebřík)*"]
+        header = "📋 *ENTRY PLAN (žebřík)*"
+        if weak_setup:
+            header += "  ⚠️ _slabý setup — jen orientačně_"
+        entry_plan_lines = ["━━━━━━━━━━━━━━━━━━━━━━", header]
         for i, tr in enumerate(ladder["tranches"]):
             entry_plan_lines.append(
                 f" {num_emoji[i]} `{_fmt_price(tr['price'])}`  {tr['weight']*100:.0f} %  "
