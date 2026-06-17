@@ -1461,8 +1461,14 @@ def _gather_fundamentals(ticker: str) -> dict:
         "price": price, "target": target, "upside": upside, "trend": trend,
         "wk_low": num("fiftyTwoWeekLow"), "wk_high": num("fiftyTwoWeekHigh"),
         "rec": info.get("recommendationKey"), "n_analysts": num("numberOfAnalystOpinions"),
+        "target_high": num("targetHighPrice"), "target_low": num("targetLowPrice"),
         "div_yield": div_yield, "payout": payout, "forward_pe": num("forwardPE"),
         "ps_raw": ps, "rev_g_raw": rev_g, "eps_g_raw": eps_g, "net_m_raw": net_m,
+        # Business pole pro /dd deep dive (jeden tk.info fetch pro vše).
+        "industry": info.get("industry"), "employees": num("fullTimeEmployees"),
+        "country": info.get("country"), "website": info.get("website"),
+        "business_summary": info.get("longBusinessSummary"),
+        "revenue": rev,
         "growth": score_growth(rev_g, eps_g, q_g),
         "profit": score_profitability(net_m, oper_m, gross_m, roe, roa),
         "balance": score_balance(d_e, curr, cash, debt, quick),
@@ -2599,6 +2605,193 @@ async def gather_genius(ticker: str) -> dict:
         "ticker": ticker, "last": last,
         "tech": tech, "flow": flow, "news": news, "earn_days": earn_days,
     })
+
+# ==============================================================================
+# 3b. DEEP DIVE (/dd) — grand syntéza: business + fundament + fér hodnota + AI
+# ==============================================================================
+# Nejkomplexnější příkaz: stáhne, co firma DĚLÁ (business summary), její čísla,
+# fér hodnotu, reálné news katalyzátory, cíle analytiků a earnings — pak to nechá
+# LLM analytika (70b → fallback 8b) složit do hloubkového research reportu.
+# Tvrdá data se zobrazí VŽDY (i bez LLM); výhledové „plány/kontrakty" jdou jen do
+# jasně označené sekce „Kontext (ověř si)", aby se nepletl ověřený fakt s dohadem.
+
+DD_SYSTEM = (
+    "Jsi seniorní akciový analytik. Z DODANÉHO dossieru napiš hloubkový, konkrétní "
+    "deep-dive v češtině.\n"
+    "PRAVIDLA:\n"
+    "1) Fakta a čísla ber VÝHRADNĚ z dossieru. Nikdy si nevymýšlej ceny, cíle, "
+    "kontrakty ani čísla, která tam nejsou.\n"
+    "2) Pro výhledové věci (strategie, možné kontrakty, konkurence) smíš přidat "
+    "kontext ze svých znalostí, ALE jen do sekce „📚 Kontext (ověř si)“ a formuluj "
+    "ho jako „pravděpodobně/historicky“, ne jako potvrzený fakt.\n"
+    "3) Použij PŘESNĚ tyto nadpisy a pořadí:\n"
+    "🎯 *Byznys model* — jak firma vydělává (2–3 věty).\n"
+    "🚀 *Plány & katalyzátory* — co ji žene dopředu, z news + earnings + cílů analytiků.\n"
+    "📚 *Kontext (ověř si)* — strategie/kontrakty/konkurence z tvých znalostí, jasně jako neověřené.\n"
+    "💪 *Silné stránky* — 2–3 odrážky opřené o skóre/čísla.\n"
+    "🚩 *Rizika* — 2–3 odrážky.\n"
+    "🧠 *Verdikt* — bull case (1 věta) vs bear case (1 věta) + „co sledovat“.\n"
+    "Buď konkrétní, žádné prázdné fráze. Markdown s *tučným*. Max ~350 slov."
+)
+
+def _dd_hard_facts(data: dict, earn_days, news_titles: list[str]) -> list[str]:
+    """Tvrdá, ověřená data do hlavičky deep dive — zobrazí se VŽDY, i bez LLM."""
+    t = data["ticker"]
+    name = data.get("name") or t
+    industry = data.get("industry") or data.get("sector") or ""
+    emp = data.get("employees")
+    emp_str = f"{int(emp):,} zam.".replace(",", " ") if emp else ""
+    sub = " · ".join(x for x in [name, industry, emp_str] if x)
+    lines = [f"🔬 *DEEP DIVE: {t}*", f"_{sub}_", "━━━━━━━━━━━━━━━━━━━━━━"]
+
+    bs = data.get("business_summary")
+    if bs:
+        short = bs[:360]
+        if len(bs) > 360:
+            short = short.rsplit(" ", 1)[0] + "…"
+        lines += ["🏢 *Co firma dělá:*", f"_{short}_"]
+
+    bits = []
+    if data.get("market_cap"): bits.append(f"cap {_cap_label(data['market_cap'])}")
+    if data.get("revenue"):    bits.append(f"tržby {_fmt_big(data['revenue'])}")
+    if data.get("price"):      bits.append(f"cena {_fmt_price(data['price'])}")
+    if bits:
+        lines.append("💰 " + "  ·  ".join(bits))
+
+    rec = _rec_label(data.get("rec"))
+    if rec:
+        extra = []
+        if data.get("target"):
+            up = data.get("upside")
+            extra.append(f"cíl {_fmt_price(data['target'])}" + (f" ({up:+.0f}%)" if up is not None else ""))
+        if data.get("target_low") and data.get("target_high"):
+            extra.append(f"rozpětí {_fmt_price(data['target_low'])}–{_fmt_price(data['target_high'])}")
+        n = data.get("n_analysts")
+        nstr = f" ({n:.0f})" if n else ""
+        tail = ("  ·  " + "  ·  ".join(extra)) if extra else ""
+        lines.append(f"🏆 Analytici: {rec}{nstr}{tail}")
+
+    if earn_days is not None and earn_days >= 0:
+        warn = "  ⚠️ _binární riziko_" if earn_days <= 7 else ""
+        lines.append(f"📅 Výsledky za *{earn_days}* dní{warn}")
+
+    if news_titles:
+        lines.append("📰 *Poslední katalyzátory:*")
+        for tt in news_titles[:4]:
+            lines.append(f"  • {tt}")
+
+    lines += _fair_value_lines(data)     # fér hodnota (reuse, grounded)
+    return lines
+
+def _dd_llm_dossier(data: dict, prof: dict, fv: dict | None, earn_days,
+                    news_titles: list[str], flow_label: str | None) -> str:
+    """Kompaktní faktický balík pro LLM — jen ověřená čísla, model je nesmí měnit."""
+    def s(x): return f"{x:.0f}" if x is not None else "—"
+    P = []
+    P.append(f"FIRMA: {data.get('name')} ({data['ticker']}) | sektor "
+             f"{data.get('sector')} / {data.get('industry')} | "
+             f"{int(data['employees']) if data.get('employees') else '?'} zam. | "
+             f"sídlo {data.get('country')}")
+    if data.get("business_summary"):
+        P.append("CO DĚLÁ: " + data["business_summary"][:600])
+    fin = []
+    if data.get("market_cap"):      fin.append(f"cap {_fmt_big(data['market_cap'])}")
+    if data.get("revenue"):         fin.append(f"tržby {_fmt_big(data['revenue'])}")
+    fpe = data.get("forward_pe")
+    if fpe is not None and 0 < fpe < 200:   # záporné/extrémní P/E u ztrátových firem je nesmysl
+        fin.append(f"fwd P/E {fpe:.1f}")
+    if data.get("ps_raw"):          fin.append(f"P/S {data['ps_raw']:.1f}")
+    if data.get("rev_g_raw") is not None: fin.append(f"růst tržeb {data['rev_g_raw']:+.0f}%")
+    if data.get("net_m_raw") is not None: fin.append(f"čistá marže {data['net_m_raw']:.0f}%")
+    if fin:
+        P.append("ČÍSLA: " + " | ".join(fin))
+    P.append(f"SKÓRE (0-100, vyšší=lepší; u valuace vyšší=levnější): "
+             f"růst {s(data['growth']['score'])}, ziskovost {s(data['profit']['score'])}, "
+             f"rozvaha {s(data['balance']['score'])}, valuace {s(data['value']['score'])}, "
+             f"cashflow {s(data['cashflow']['score'])}")
+    if prof.get("verdict"):
+        P.append(f"VERDIKT KVALITA×CENA: {prof['verdict']}")
+    if fv:
+        P.append(f"FÉR HODNOTA: base {_fmt_money(fv['base'])} (gap {fv['gap']:+.0f}% vůči ceně), "
+                 f"kotva {fv['anchor']}, verdikt {fv['verdict']}")
+    rec = _rec_label(data.get("rec"))
+    if rec:
+        up = data.get("upside")
+        up_str = f", upside {up:+.0f}%" if up is not None else ""
+        P.append(f"ANALYTICI: {rec} ({data.get('n_analysts') or '?'}), "
+                 f"cíl {_fmt_price(data.get('target'))}, aktuál {_fmt_price(data.get('price'))}{up_str}")
+    if earn_days is not None:
+        P.append(f"EARNINGS: za {earn_days} dní")
+    if flow_label:
+        P.append(f"OPČNÍ FLOW (institucionální): {flow_label}")
+    if news_titles:
+        P.append("REÁLNÉ NEWS TITULKY:\n" + "\n".join(f"- {x}" for x in news_titles[:6]))
+    return "\n".join(P)
+
+async def _dd_flow_label(ticker: str, spot):
+    """Jednořádkový institucionální flow kontext (None když nedostupné)."""
+    if not spot:
+        return None
+    try:
+        hits, _ = await asyncio.to_thread(
+            analyze_options_flow, ticker, spot,
+            min_vol_oi=0.0, min_premium=20_000, min_vol=50, rank_by_oi=True)
+        if not hits:
+            return None
+        score, _, conf = compute_flow_score(hits)
+        d = "býčí" if score > 0.2 else "medvědí" if score < -0.2 else "neutrální"
+        return f"{d} (score {score:+.2f}, {conf})"
+    except Exception:
+        return None
+
+async def produce_deep_dive(ticker: str) -> str:
+    """Sestaví deep dive: tvrdá data (vždy) + AI syntéza (70b → fallback 8b)."""
+    ticker = ticker.upper()
+    data = await asyncio.to_thread(_gather_fundamentals, ticker)
+    if not data or data.get("price") is None:
+        return (f"❌ Nepodařilo se načíst data pro *{ticker}*.\n"
+                f"_Yahoo nevrací fundamenty (neplatný ticker, nebo dočasná blokace)._")
+
+    news_items, earn_days, flow_label = await asyncio.gather(
+        asyncio.to_thread(fetch_yahoo_rss, ticker),
+        _next_earnings_days_async(ticker),
+        _dd_flow_label(ticker, data.get("price")),
+    )
+    # dedup titulků (RSS občas opakuje), zachovej pořadí
+    seen, news_titles = set(), []
+    for it in (news_items or []):
+        tt = it.get("title", "").strip()
+        if tt and tt not in seen:
+            seen.add(tt); news_titles.append(tt)
+
+    prof = _build_profile(data)
+    fv = fair_value(data.get("price"), data.get("ps_raw"), data.get("forward_pe"),
+                    data.get("rev_g_raw"), data.get("eps_g_raw"), data.get("net_m_raw"))
+
+    lines = _dd_hard_facts(data, earn_days, news_titles)
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
+    narrative = None
+    if client is not None:
+        prompt = DD_SYSTEM + "\n\nDOSSIER:\n" + _dd_llm_dossier(
+            data, prof, fv, earn_days, news_titles, flow_label)
+        narrative = await ask_groq(prompt, temperature=0.4, model=GROQ_MODEL)
+        if narrative is None:                       # rate-limit/výpadek 70b → 8b
+            narrative = await ask_groq(prompt, temperature=0.4, model=GROQ_FAST_MODEL)
+
+    if narrative:
+        lines.append("🧠 *ANALÝZA (AI):*")
+        lines.append(narrative.strip())
+    else:
+        lines.append("🧠 _AI analýza teď nedostupná (chybí Groq klíč nebo rate-limit) "
+                     "— tvrdá data výše platí._")
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "ℹ️ _Deep dive = tvrdá data z Yahoo + AI syntéza. Sekce „📚 Kontext“ je z modelu "
+        "(může být zastaralá) — ověř si. Ne investiční doporučení._",
+    ]
+    return "\n".join(lines)
 
 # ==============================================================================
 # 3c. EDGE LAB — historická validace setupů (backtest)
@@ -3748,6 +3941,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📖 *AKCIOVÝ GENIUS 2.0 — PŘEHLED PŘÍKAZŮ*\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "*🧭 Investor (akcie)*\n"
+        "• `/dd RKLB` – 🔬 deep dive: co firma dělá, plány, katalyzátory + AI analýza\n"
         "• `/profil AAPL` – investiční profil + fundamentální scorecard\n"
         "• `/genius AAPL` – fúze techniky + flow + news (0–100)\n"
         "• `/edge AAPL` – backtest historické úspěšnosti setupů\n"
@@ -4639,6 +4833,22 @@ async def handle_ticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                     f"*{ticker}*:", parse_mode="Markdown",
                                     reply_markup=nav_keyboard(ticker, exclude="chart"))
 
+async def dd_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """🔬 Deep Dive — co firma dělá, plány, katalyzátory, fér hodnota + AI analýza."""
+    if not ctx.args:
+        await update.message.reply_text(
+            "Použití: `/dd RKLB`\n"
+            "_Hloubkový rozbor firmy: co dělá, plány & katalyzátory, fér hodnota, "
+            "cíle analytiků a AI syntéza. Nejkomplexnější funkce — chvíli to trvá._",
+            parse_mode="Markdown")
+        return
+    ticker = ctx.args[0].upper()
+    msg = await update.message.reply_text(
+        f"🔬 Skládám *deep dive* pro *{ticker}* — business, fundament, katalyzátory, "
+        f"AI analýza... _(chvíli to trvá)_", parse_mode="Markdown")
+    text = await produce_deep_dive(ticker)
+    await deliver_result(msg, update.message, text, nav_keyboard(ticker))
+
 async def genius_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """🧠 Genius Score — sloučí techniku, options flow a news do 1 přesvědčení."""
     if not ctx.args:
@@ -4799,6 +5009,7 @@ def main():
     app.add_handler(CommandHandler("news", news))
     app.add_handler(CommandHandler(["flow", "unusual", "whales"], flow_cmd))
     app.add_handler(CommandHandler(["rentgen", "xray"], xray_cmd))
+    app.add_handler(CommandHandler(["dd", "deepdive"], dd_cmd))
     app.add_handler(CommandHandler(["genius", "g"], genius_cmd))
     app.add_handler(CommandHandler(["edge", "backtest"], edge_cmd))
     app.add_handler(CommandHandler(["profil", "investice", "earnings"], earnings_cmd))

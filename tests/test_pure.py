@@ -425,6 +425,54 @@ def test_smart_money_sorted_by_premium():
     assert "akumulace" in r["signals"][0].lower()   # 900k blok první
 
 
+def _dd_sample_data():
+    return {
+        "ticker": "RKLB", "name": "Rocket Lab", "sector": "Industrials",
+        "industry": "Aerospace & Defense", "employees": 2600.0, "country": "USA",
+        "business_summary": "Rocket Lab provides launch services and space systems.",
+        "market_cap": 67_000_000_000.0, "revenue": 680_000_000.0, "price": 108.0,
+        "forward_pe": -14852.8, "ps_raw": 99.3, "rev_g_raw": 64.0, "eps_g_raw": None,
+        "net_m_raw": -27.0, "rec": "strong_buy", "n_analysts": 17.0,
+        "target": 107.0, "target_low": 60.0, "target_high": 150.0, "upside": -1.0,
+        "growth": {"score": 100}, "profit": {"score": 17}, "balance": {"score": 99},
+        "value": {"score": 18}, "cashflow": {"score": 15},
+    }
+
+
+def test_dd_hard_facts_has_business_and_catalysts():
+    lines = ag._dd_hard_facts(_dd_sample_data(), earn_days=12,
+                              news_titles=["RKLB to Join Nasdaq-100", "Why RKLB up"])
+    blob = "\n".join(lines)
+    assert "Co firma dělá" in blob               # business summary sekce
+    assert "Nasdaq-100" in blob                  # reálný katalyzátor
+    assert "Silně koupit" in blob                # rec label přeložený
+    assert "FÉR HODNOTA" in blob                 # fér hodnota přibalená
+
+
+def test_dd_hard_facts_earnings_warning_when_close():
+    near = ag._dd_hard_facts(_dd_sample_data(), earn_days=3, news_titles=[])
+    far = ag._dd_hard_facts(_dd_sample_data(), earn_days=40, news_titles=[])
+    assert any("binární riziko" in l for l in near)     # ≤7 dní → varování
+    assert not any("binární riziko" in l for l in far)
+
+
+def test_dd_dossier_suppresses_nonsense_fwd_pe():
+    # Ztrátová firma → záporné/extrémní fwd P/E se do dossieru nedostane.
+    d = ag._dd_llm_dossier(_dd_sample_data(), {"verdict": "🟡 Průměr"}, None,
+                           12, ["news"], None)
+    assert "fwd P/E" not in d
+    assert "P/S 99.3" in d                        # P/S naopak ano
+    assert "růst tržeb +64%" in d
+
+
+def test_dd_dossier_includes_real_news_and_scores():
+    d = ag._dd_llm_dossier(_dd_sample_data(), {"verdict": "x"}, None,
+                           5, ["Big contract signed", "Earnings beat"], "býčí")
+    assert "Big contract signed" in d             # reálné titulky dovnitř
+    assert "SKÓRE" in d and "růst 100" in d
+    assert "OPČNÍ FLOW" in d
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
