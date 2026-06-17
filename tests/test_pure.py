@@ -368,6 +368,63 @@ def test_fair_value_none_without_anchor():
     assert ag.fair_value(price=None, ps=10, fwd_pe=15, rev_g=10, eps_g=10) is None
 
 
+def test_divergence_bullish_hidden_accumulation():
+    # Cena dolů, flow býčí → skrytá akumulace (předzvěst obratu nahoru).
+    d = ag.sentiment_divergence(price_chg_pct=-8.0, flow_score=0.6)
+    assert d["kind"] == "bull_div"
+    assert d["emoji"] == "🟢"
+
+
+def test_divergence_bearish_distribution_top():
+    # Cena nahoru, flow medvědí → distribuce na vrcholu.
+    d = ag.sentiment_divergence(price_chg_pct=7.0, flow_score=-0.5)
+    assert d["kind"] == "bear_div"
+
+
+def test_divergence_confirmation_when_aligned():
+    assert ag.sentiment_divergence(6.0, 0.5)["kind"] == "bull_confirm"
+    assert ag.sentiment_divergence(-6.0, -0.5)["kind"] == "bear_confirm"
+
+
+def test_divergence_neutral_when_flat():
+    assert ag.sentiment_divergence(0.5, 0.05)["kind"] == "neutral"
+
+
+def test_smart_money_empty():
+    r = ag.smart_money_readout([], 0.0)
+    assert r["signals"] == [] and r["conviction"] == 0
+
+
+def test_smart_money_detects_accumulation_and_sweep():
+    hits = [
+        {"opt_type": "call", "strike": 50, "exp": "2026-09-18", "dte": 90,
+         "premium": 800_000, "bscore_sum": 2, "executions": 3, "moneyness": "OTM",
+         "accum": {"is_accum": True, "days": 4, "oi_growth": 2.3}},
+        {"opt_type": "put", "strike": 30, "exp": "2026-09-18", "dte": 90,
+         "premium": 120_000, "bscore_sum": -2, "executions": 1, "moneyness": "OTM",
+         "accum": None},
+    ]
+    r = ag.smart_money_readout(hits, flow_score=0.6)
+    joined = " ".join(r["signals"])
+    assert "akumulace" in joined.lower()         # OI roste víc dní
+    assert "sweep" in joined.lower()             # 3× fill
+    assert r["conviction"] > 0
+    assert "nahoru" in r["verdict"].lower()      # flow_score > 0.3
+
+
+def test_smart_money_sorted_by_premium():
+    # Větší prémium = signál výš v seznamu.
+    hits = [
+        {"opt_type": "call", "strike": 50, "exp": "2026-09-18", "dte": 90,
+         "premium": 200_000, "bscore_sum": 2, "executions": 1, "moneyness": "OTM", "accum": None},
+        {"opt_type": "call", "strike": 60, "exp": "2026-09-18", "dte": 90,
+         "premium": 900_000, "bscore_sum": 2, "executions": 2, "moneyness": "OTM",
+         "accum": {"is_accum": True, "days": 3, "oi_growth": 1.8}},
+    ]
+    r = ag.smart_money_readout(hits, 0.5)
+    assert "akumulace" in r["signals"][0].lower()   # 900k blok první
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

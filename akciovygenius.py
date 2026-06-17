@@ -1906,6 +1906,141 @@ def fmt_usd(val: float) -> str:
     if val >= 1_000: return f"${val/1_000:.0f}K"
     return f"${val:.0f}"
 
+# ── 🩻 RENTGEN: smart-money rekonstrukce + cena vs. realita (divergence) ───────
+def sentiment_divergence(price_chg_pct: float, flow_score: float) -> dict:
+    """Porovná POHYB CENY s OPČNÍM FLOW. Divergence = graf říká jedno, chytré peníze
+    druhé → často předpověď obratu DŘÍV, než se projeví v ceně.
+
+    price_chg_pct = % změna ceny za poslední okno (např. 5 dní)
+    flow_score    = -1..+1 (kladné = býčí opční flow, záporné = medvědí)"""
+    price_up, price_down = price_chg_pct > 2.0, price_chg_pct < -2.0
+    flow_bull, flow_bear = flow_score > 0.2, flow_score < -0.2
+    strength = min(100, int(abs(flow_score) * 60 + min(abs(price_chg_pct), 25) * 1.6))
+
+    if price_down and flow_bull:
+        return {"kind": "bull_div", "emoji": "🟢", "strength": strength,
+                "title": "Býčí divergence (skrytá akumulace)",
+                "desc": "Cena padá, ale opční flow je býčí — retail panikaří a prodává, zatímco "
+                        "chytré peníze pod tím tiše nakupují. Klasický předobraz obratu nahoru."}
+    if price_up and flow_bear:
+        return {"kind": "bear_div", "emoji": "🔴", "strength": strength,
+                "title": "Medvědí divergence (distribuce na vrcholu)",
+                "desc": "Cena roste, ale opční flow chladne až je medvědí — do síly se potichu "
+                        "rozprodává. Rally bez paliva, zvýšená opatrnost."}
+    if price_up and flow_bull:
+        return {"kind": "bull_confirm", "emoji": "✅", "strength": strength,
+                "title": "Býčí potvrzení",
+                "desc": "Cena i flow táhnou nahoru — trend má palivo a chytré peníze jedou s ním. "
+                        "Zdravé, ne kontrariánské."}
+    if price_down and flow_bear:
+        return {"kind": "bear_confirm", "emoji": "⛔", "strength": strength,
+                "title": "Medvědí potvrzení",
+                "desc": "Cena padá a flow padá s ní — žádná skrytá podpora, nikdo to dole nechytá. "
+                        "Nechytej padající nůž."}
+    return {"kind": "neutral", "emoji": "➡️", "strength": strength,
+            "title": "Bez divergence",
+            "desc": "Cena ani flow nedávají jasný protisměrný signál. Nic, co by křičelo obrat."}
+
+
+def smart_money_readout(hits: list[dict], flow_score: float) -> dict:
+    """Z opčního flow zrekonstruuje, CO velcí hráči dělají — ne jen 'flow je býčí', ale
+    příběh: kdo tiše nabaluje (akumulace), kde je agrese (sweepy), sázky na pohyb."""
+    if not hits:
+        return {"signals": [], "verdict": "Žádný čitelný institucionální flow.", "conviction": 0,
+                "total_premium": 0.0}
+
+    total_prem = sum(h.get("premium", 0.0) for h in hits)
+    signals = []   # (premium_pro_řazení, text)
+
+    # 1) Akumulace: OI roste víc dní po sobě = staví se pozice, ne jednorázová spekulace.
+    accum = [h for h in hits if (h.get("accum") or {}).get("is_accum")]
+    if accum:
+        a = max(accum, key=lambda h: h.get("premium", 0))
+        ot = "cally" if a["opt_type"] == "call" else "puty"
+        d = a["accum"]["days"]
+        signals.append((a["premium"],
+            f"🟢 *Tichá akumulace* — někdo už {d}. den po sobě nabaluje {ot} ${a['strike']:.0f} "
+            f"(exp {a['exp']}). OI roste {a['accum']['oi_growth']:.1f}× — staví se pozice, ne spekulace."))
+
+    # 2) Sweep: jeden záměr rozsekaný přes víc fillů = urgence, bere se přes nabídku trhu.
+    sweeps = [h for h in hits if h.get("executions", 1) >= 2 and abs(h.get("bscore_sum", 0)) >= 1]
+    if sweeps:
+        s = max(sweeps, key=lambda h: h.get("premium", 0))
+        dir_ = "nahoru" if s["bscore_sum"] > 0 else "dolů"
+        ot = "callů" if s["opt_type"] == "call" else "putů"
+        signals.append((s["premium"],
+            f"⚡ *Sweep ({s['executions']}× fill)* — agresivní nákup {ot} ${s['strike']:.0f} přes víc "
+            f"burz najednou. Někdo spěchal vsadit na pohyb {dir_} — urgence, ne trpělivý limit."))
+
+    # 3) OTM cally s delší expiraci = sázka na výrazný pohyb nahoru (často před katalyzátorem).
+    otm_calls = [h for h in hits if h["opt_type"] == "call" and "OTM" in h.get("moneyness", "")
+                 and h.get("dte", 0) >= 25 and h.get("bscore_sum", 0) >= 1]
+    if otm_calls:
+        c = max(otm_calls, key=lambda h: h.get("premium", 0))
+        signals.append((c["premium"],
+            f"🎯 *Sázka na upside* — nákup OTM callů ${c['strike']:.0f} {c['dte']}d dopředu "
+            f"({fmt_usd(c['premium'])}). Někdo platí za výrazný pohyb nahoru, ještě než přijde."))
+
+    # 4) OTM puty proti směru = hedge velké pozice nebo přímá sázka na pád.
+    otm_puts = [h for h in hits if h["opt_type"] == "put" and h.get("bscore_sum", 0) <= -1
+                and h.get("dte", 0) >= 25]
+    if otm_puts:
+        p = max(otm_puts, key=lambda h: h.get("premium", 0))
+        signals.append((p["premium"],
+            f"🛡 *Downside sázka / hedge* — nákup putů ${p['strike']:.0f} {p['dte']}d "
+            f"({fmt_usd(p['premium'])}). Velký hráč se jistí proti pádu (nebo na něj přímo sází)."))
+
+    signals.sort(key=lambda x: x[0], reverse=True)
+    sig_lines = [s[1] for s in signals[:4]]
+
+    conviction = min(100, int(min(total_prem / 100_000, 60) + abs(flow_score) * 40))
+    if not sig_lines:
+        verdict = "Flow je rozptýlený — žádný jasný institucionální záměr."
+    elif flow_score > 0.3:
+        verdict = "Chytré peníze se klaní *nahoru* — kupují agresivně cally."
+    elif flow_score < -0.3:
+        verdict = "Chytré peníze se klaní *dolů* — staví puty / prodávají sílu."
+    else:
+        verdict = "Velcí hráči jsou aktivní, ale obě strany se přetahují."
+
+    return {"signals": sig_lines, "verdict": verdict, "conviction": conviction,
+            "total_premium": total_prem}
+
+
+def _meter(pct: float, width: int = 10) -> str:
+    """Jednoduchý blokový ukazatel 0–100 → ▰▰▰▱▱…"""
+    pct = max(0, min(100, pct))
+    filled = round(pct / 100 * width)
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def format_xray(ticker: str, spot: float, price_chg_pct: float,
+                hits: list[dict], flow_score: float, confidence: str) -> str:
+    """Složí rentgen: smart-money příběh + divergence cena↔flow do jedné zprávy."""
+    sm = smart_money_readout(hits, flow_score)
+    div = sentiment_divergence(price_chg_pct, flow_score)
+    lines = [
+        f"🩻 *RENTGEN: {ticker.upper()}*",
+        f"_cena {_fmt_price(spot)}  ·  5d {price_chg_pct:+.1f}%  ·  flow {flow_score:+.2f} ({confidence})_",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "*🕵️ Co dělají velcí hráči:*",
+    ]
+    lines += sm["signals"] or ["_Žádný čitelný institucionální vzorec (slabý/rozptýlený flow)._"]
+    lines += [
+        f"🧭 _{sm['verdict']}_",
+        f"💪 Conviction `{sm['conviction']}/100`  {_meter(sm['conviction'])}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "*🪞 Cena vs. realita (divergence):*",
+        f"{div['emoji']} *{div['title']}*  ·  síla `{div['strength']}/100`",
+        f"_{div['desc']}_",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "ℹ️ _Rentgen čte opční flow: kdo nabaluje pozice (akumulace), kdo spěchá (sweep) a "
+        "jestli flow souhlasí s cenou. Divergence cena↔flow je nejcennější — ukáže, co graf "
+        "ještě neukázal. Ne investiční doporučení._",
+    ]
+    return "\n".join(lines)
+
+
 def format_unusual(ticker: str, hits: list[dict], spot: float, market_cap: float) -> str:
     if not hits:
         return f"🌊 *Unusual Flow: {ticker.upper()}*\n✅ Žádná neobvyklá aktivita (Vol/OI ≥ 3×, prémium ≥ $50k)."
@@ -2773,6 +2908,33 @@ async def produce_flow_ticker(ticker: str) -> str:
     except Exception as e:
         return f"❌ Chyba: {e}"
 
+async def produce_xray(ticker: str) -> str:
+    """🩻 Rentgen: smart-money rekonstrukce + divergence cena vs. opční flow."""
+    try:
+        tk = yf_ticker(ticker)
+        hist = await asyncio.wait_for(asyncio.to_thread(tk.history, period="10d"), timeout=30.0)
+        if hist.empty:
+            return f"❌ Nepodařilo se načíst tržní cenu pro *{ticker}*."
+        closes = hist["Close"].dropna()
+        spot = float(closes.iloc[-1])
+        ref = float(closes.iloc[-6]) if len(closes) >= 6 else float(closes.iloc[0])
+        price_chg = (spot / ref - 1.0) * 100 if ref > 0 else 0.0
+        hits, _ = await asyncio.wait_for(
+            asyncio.to_thread(analyze_options_flow, ticker, spot), timeout=30.0)
+        if not hits:
+            return (f"🩻 *RENTGEN: {ticker.upper()}*\n"
+                    f"_cena {_fmt_price(spot)}  ·  5d {price_chg:+.1f}%_\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"❌ Žádný čitelný opční flow (málo likvidity nebo Yahoo nevrací opce).\n"
+                    f"_Rentgen potřebuje opční data — zkus likvidnější titul (PLTR, NVDA, AMD…)._")
+        flow_score, _, confidence = compute_flow_score(hits)
+        await asyncio.to_thread(save_flow_history)
+        return format_xray(ticker, spot, price_chg, hits, flow_score, confidence)
+    except asyncio.TimeoutError:
+        return "❌ Rentgen trval moc dlouho (opční trh)."
+    except Exception as e:
+        return f"❌ Chyba: {e}"
+
 async def produce_news(ticker: str):
     """Vrací (text, items). Když nejsou zprávy → (None, None)."""
     items = await asyncio.to_thread(fetch_yahoo_rss, ticker)
@@ -3549,6 +3711,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*🌊 Flow & Whales*\n"
         "• `/flow AAPL` – hloubkový opční flow tickeru (whale bloky, akumulace)\n"
         "• `/flow` – plošný whale sken trhu (bez tickeru)\n"
+        "• `/rentgen PLTR` – 🩻 co dělají velcí hráči + divergence cena vs. flow\n"
         "• `/akumulace` – 🧲 strikes, co se nabalují víc dní (volitelně `/akumulace PLTR`)\n"
         "• `/whaleradar on` – 🐋 živý radar velkých opčních bloků\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -4285,6 +4448,19 @@ async def flow_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = await produce_whales_scan()
         await deliver_result(msg, update.message, text, None)
 
+async def xray_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """🩻 Rentgen tickeru — co dělají velcí hráči v opcích + divergence cena vs. flow."""
+    if not ctx.args:
+        return await update.message.reply_text(
+            "Použití: `/rentgen PLTR`\n"
+            "_Ukáže, co dělají velcí hráči v opcích (akumulace, sweepy, sázky) a jestli "
+            "opční flow souhlasí s cenou, nebo proti ní (divergence = předzvěst obratu)._",
+            parse_mode="Markdown")
+    ticker = ctx.args[0].upper()
+    msg = await update.message.reply_text(f"🩻 Rentgenuji *{ticker}*...", parse_mode="Markdown")
+    text = await produce_xray(ticker)
+    await deliver_result(msg, update.message, text, nav_keyboard(ticker, exclude=""))
+
 async def akumulace_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Co se právě nabaluje: strikes s vícedenní akumulací napříč pamětí enginu.
     Volitelně filtruj na ticker: `/akumulace PLTR`."""
@@ -4577,6 +4753,7 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("news", news))
     app.add_handler(CommandHandler(["flow", "unusual", "whales"], flow_cmd))
+    app.add_handler(CommandHandler(["rentgen", "xray"], xray_cmd))
     app.add_handler(CommandHandler(["genius", "g"], genius_cmd))
     app.add_handler(CommandHandler(["edge", "backtest"], edge_cmd))
     app.add_handler(CommandHandler(["profil", "investice", "earnings"], earnings_cmd))
