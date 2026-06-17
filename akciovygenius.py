@@ -1796,7 +1796,14 @@ def flow_accumulation(ticker: str, opt_type: str, strike: float, exp: str) -> di
         hist = list(rec["history"]) if rec else []
     return _accum_from_history(hist)
 
-def analyze_options_flow(ticker: str, spot: float) -> tuple[list[dict], float]:
+def analyze_options_flow(ticker: str, spot: float, *,
+                         min_vol_oi: float = OPT_MIN_VOL_OI,
+                         min_premium: float = OPT_MIN_PREMIUM,
+                         min_vol: int = OPT_MIN_VOL,
+                         rank_by_oi: bool = False) -> tuple[list[dict], float]:
+    """Stáhne a agreguje opční flow. Výchozí = 'unusual' režim (/flow): vyžaduje
+    nezvyklý spike vol/OI≥3×. Pro 'positioning' (/rentgen) se gate uvolní — chytré
+    peníze pozicují i bez dnešního spiku, čte se velikost stojící sázky (OI/prémie)."""
     if spot <= 0: return [], 0.0
     tk = yf_ticker(ticker)
     
@@ -1835,9 +1842,9 @@ def analyze_options_flow(ticker: str, spot: float) -> tuple[list[dict], float]:
                 iv_raw = _safe(row.get("impliedVolatility"))
                 strike = _safe(row.get("strike"))
                 
-                if iv_raw > 5 or vol < OPT_MIN_VOL or oi < OPT_MIN_OI or last <= 0 or (vol / oi < OPT_MIN_VOL_OI): continue
+                if iv_raw > 5 or vol < min_vol or oi < OPT_MIN_OI or last <= 0 or (vol / oi < min_vol_oi): continue
                 premium = vol * last * 100
-                if premium < OPT_MIN_PREMIUM: continue
+                if premium < min_premium: continue
 
                 mon_label, delta_w = moneyness(strike, spot, opt_type)
                 aggr   = aggression_score(last, bid, ask)
@@ -1870,7 +1877,12 @@ def analyze_options_flow(ticker: str, spot: float) -> tuple[list[dict], float]:
 
     if not agg: return [], market_cap
     results = list(agg.values())
-    results.sort(key=lambda x: x["wscore"], reverse=True)
+    # Positioning (/rentgen): řaď podle velikosti stojící pozice (OI × cena), aby
+    # vyplavaly velké sázky i v klidný den. Unusual (/flow): podle agrese (wscore).
+    if rank_by_oi:
+        results.sort(key=lambda x: x["oi"] * x["last"], reverse=True)
+    else:
+        results.sort(key=lambda x: x["wscore"], reverse=True)
     top = results[:12]
 
     # Engine má paměť: ulož dnešní stav a obohať bloky o trend (akumulace/distribuce).
@@ -2015,16 +2027,41 @@ def _meter(pct: float, width: int = 10) -> str:
 
 
 def format_xray(ticker: str, spot: float, price_chg_pct: float,
-                hits: list[dict], flow_score: float, confidence: str) -> str:
-    """Složí rentgen: smart-money příběh + divergence cena↔flow do jedné zprávy."""
+                hits: list[dict], flow_score: float, confidence: str,
+                quotes_live: bool = True) -> str:
+    """Složí rentgen: smart-money příběh + divergence cena↔flow do jedné zprávy.
+    quotes_live=False (zavřený opční trh) → bid/ask jsou mrtvé, směr nejde číst."""
     sm = smart_money_readout(hits, flow_score)
     div = sentiment_divergence(price_chg_pct, flow_score)
     lines = [
         f"🩻 *RENTGEN: {ticker.upper()}*",
         f"_cena {_fmt_price(spot)}  ·  5d {price_chg_pct:+.1f}%  ·  flow {flow_score:+.2f} ({confidence})_",
         "━━━━━━━━━━━━━━━━━━━━━━",
-        "*🕵️ Co dělají velcí hráči:*",
     ]
+    if not quotes_live:
+        # Mimo US hodiny Yahoo nuluje bid/ask → směr flow (kdo je agresor) nejde číst.
+        lines += [
+            "⏰ *Opční trh je zavřený* (mimo US hodiny).",
+            "_Bid/ask jsou mrtvé, takže SMĚR flow a divergenci teď spolehlivě nepřečtu — "
+            "vidím jen velikosti pozic. Pusť rentgen za US obchodních hodin (15:30–22:00 "
+            "CET) a rozsvítí se naplno._",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            "*🕵️ Největší stojící pozice (OI):*",
+        ]
+        for h in hits[:5]:
+            ot = "📞 call" if h["opt_type"] == "call" else "📉 put"
+            acc = ""
+            if (h.get("accum") or {}).get("is_accum"):
+                acc = f"  🟢 akumulace {h['accum']['days']}d"
+            lines.append(f"  {ot} `${h['strike']:.0f}` exp {h['exp']} · OI {h['oi']:,} · "
+                         f"{fmt_usd(h['premium'])}{acc}")
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            "ℹ️ _Rentgen čte opční flow. Směrový (býk/medvěd) a divergenční signál "
+            "potřebuje živé bid/ask z otevřeného US trhu. Ne investiční doporučení._",
+        ]
+        return "\n".join(lines)
+    lines += ["*🕵️ Co dělají velcí hráči:*"]
     lines += sm["signals"] or ["_Žádný čitelný institucionální vzorec (slabý/rozptýlený flow)._"]
     lines += [
         f"🧭 _{sm['verdict']}_",
@@ -2920,7 +2957,11 @@ async def produce_xray(ticker: str) -> str:
         ref = float(closes.iloc[-6]) if len(closes) >= 6 else float(closes.iloc[0])
         price_chg = (spot / ref - 1.0) * 100 if ref > 0 else 0.0
         hits, _ = await asyncio.wait_for(
-            asyncio.to_thread(analyze_options_flow, ticker, spot), timeout=30.0)
+            asyncio.to_thread(
+                lambda: analyze_options_flow(
+                    ticker, spot, min_vol_oi=0.0, min_premium=20_000,
+                    min_vol=50, rank_by_oi=True)),
+            timeout=30.0)
         if not hits:
             return (f"🩻 *RENTGEN: {ticker.upper()}*\n"
                     f"_cena {_fmt_price(spot)}  ·  5d {price_chg:+.1f}%_\n"
@@ -2928,8 +2969,12 @@ async def produce_xray(ticker: str) -> str:
                     f"❌ Žádný čitelný opční flow (málo likvidity nebo Yahoo nevrací opce).\n"
                     f"_Rentgen potřebuje opční data — zkus likvidnější titul (PLTR, NVDA, AMD…)._")
         flow_score, _, confidence = compute_flow_score(hits)
+        # Mimo US hodiny má Yahoo mrtvé bid/ask → směrový engine je naslepo.
+        dead = sum(1 for h in hits if h.get("ask", 0) <= 0 or h.get("ask", 0) <= h.get("bid", 0))
+        quotes_live = (dead / len(hits)) < 0.5
         await asyncio.to_thread(save_flow_history)
-        return format_xray(ticker, spot, price_chg, hits, flow_score, confidence)
+        return format_xray(ticker, spot, price_chg, hits, flow_score, confidence,
+                           quotes_live=quotes_live)
     except asyncio.TimeoutError:
         return "❌ Rentgen trval moc dlouho (opční trh)."
     except Exception as e:
