@@ -1298,6 +1298,74 @@ def invest_profile(growth, profit, balance, value, cashflow, trend, upside) -> d
             "trend": trend, "analyst": analyst, "verdict": verdict, "desc": desc}
 
 
+def fair_value(price, ps, fwd_pe, rev_g, eps_g, net_margin=None) -> dict:
+    """Expectation-aware fér hodnota. Naivní valuace má fixní 'fér násobek' a každou
+    růstovku označí za předraženou. Tady fér násobek ŠKÁLUJE S RŮSTEM — hype small-cap
+    s 40% růstem si zaslouží vysoké P/S a není automaticky drahý. Trik: fér cenu
+    nepotřebuje počet akcií, stačí cena × fér_násobek / aktuální_násobek.
+
+    Vrací bear/base/bull fér cenu, gap vůči ceně a IMPLIKOVANÝ růst (co je v ceně
+    započítané) vs konsenzus. Vrací None, když chybí kotva (P/E i P/S nedostupné).
+
+    price = aktuální cena; ps = P/S; fwd_pe = forward P/E; rev_g/eps_g = růst v %;
+    net_margin = čistá marže v % (k rozpoznání ziskovosti)."""
+    if price is None or price <= 0:
+        return None
+
+    # Růst z Yahoo bývá u low-base / one-off efektů nesmyslný (eps +325 %, tržby
+    # +1080 %). Zastropujeme ho na rozumné pásmo — nad ním je to šum a fér násobek
+    # je stejně clampnutý. capped=True → v UI připíšeme, že byl růst osekán.
+    def _cap_g(g):
+        if g is None:
+            return None, False
+        c = max(-50.0, min(90.0, g))
+        return c, (abs(c - g) > 0.5)
+
+    # Fér násobek jako funkce růstu (AGRESIVNÍ škálování — zvoleno uživatelem).
+    def fair_ps(g):                       # g v %
+        return max(0.5, min(25.0, 1.0 + 0.40 * g))
+    def fair_pe(g):                       # Lynchovo PEG≈1: fér P/E ≈ tempo růstu
+        return max(10.0, min(60.0, g))
+
+    # Kotva: zisková firma → forward P/E na zisk; jinak P/S (typický hype small-cap,
+    # kde je zisk záporný a P/E nesmyslné).
+    profitable = (fwd_pe is not None and fwd_pe > 0) and (net_margin is None or net_margin > 0)
+    if profitable and eps_g is not None and eps_g > 0:
+        anchor, cur_mult = "P/E", fwd_pe
+        g, capped = _cap_g(eps_g)
+        fair_mult_fn = fair_pe
+        implied = cur_mult                # fair_pe(g_impl) == cur_mult → g_impl == cur_mult
+    elif ps is not None and ps > 0:
+        anchor, cur_mult = "P/S", ps
+        g, capped = _cap_g(rev_g if rev_g is not None else 0.0)
+        fair_mult_fn = fair_ps
+        implied = (ps - 1.0) / 0.40        # 1 + 0.4·g_impl == ps → g_impl = (ps-1)/0.4
+    else:
+        return None
+
+    if g is None:
+        g = 0.0
+
+    # Scénáře = re-rating fér násobku (komprese/expanze), ne přepočet růstu — ten
+    # u extrémů narazí na clamp a bear/base/bull splynou. Takhle vždy rozprostřené.
+    base_mult = fair_mult_fn(g)
+    base = price * base_mult / cur_mult
+    bear = price * (base_mult * 0.70) / cur_mult
+    bull = price * (base_mult * 1.35) / cur_mult
+
+    gap = (price - base) / base * 100 if base > 0 else 0.0
+    if gap <= -20:   verdict = "🟢 Podhodnoceno"
+    elif gap < 15:   verdict = "🟡 Férově oceněno"
+    elif gap < 50:   verdict = "🟠 Zaplacený růst (draho)"
+    else:            verdict = "🔴 Výrazně předraženo"
+
+    return {
+        "anchor": anchor, "fair_mult": base_mult, "cur_mult": cur_mult,
+        "bear": bear, "base": base, "bull": bull, "gap": gap, "capped": capped,
+        "implied_growth": implied, "consensus_growth": g, "verdict": verdict,
+    }
+
+
 # ── Pomocné popisky pro „snímek firmy" (beginner-friendly) ───────────────────
 
 def _cap_label(mcap) -> str:
@@ -1394,6 +1462,7 @@ def _gather_fundamentals(ticker: str) -> dict:
         "wk_low": num("fiftyTwoWeekLow"), "wk_high": num("fiftyTwoWeekHigh"),
         "rec": info.get("recommendationKey"), "n_analysts": num("numberOfAnalystOpinions"),
         "div_yield": div_yield, "payout": payout, "forward_pe": num("forwardPE"),
+        "ps_raw": ps, "rev_g_raw": rev_g, "eps_g_raw": eps_g, "net_m_raw": net_m,
         "growth": score_growth(rev_g, eps_g, q_g),
         "profit": score_profitability(net_m, oper_m, gross_m, roe, roa),
         "balance": score_balance(d_e, curr, cash, debt, quick),
@@ -1406,6 +1475,57 @@ def _build_profile(data: dict) -> dict:
     return invest_profile(
         data["growth"]["score"], data["profit"]["score"], data["balance"]["score"],
         data["value"]["score"], data["cashflow"]["score"], data["trend"], data["upside"])
+
+
+def _fmt_money(p) -> str:
+    """Cena firmy s adaptivní přesností (penny stocky potřebují víc desetin)."""
+    if p is None:
+        return "—"
+    if p < 1:   return f"${p:.3f}"
+    if p < 10:  return f"${p:.2f}"
+    return f"${p:.0f}"
+
+
+def _fair_value_lines(data: dict) -> list:
+    """Sekce 'fér hodnota' do investičního profilu — expectation-aware valuace."""
+    fv = fair_value(
+        data.get("price"), data.get("ps_raw"), data.get("forward_pe"),
+        data.get("rev_g_raw"), data.get("eps_g_raw"), data.get("net_m_raw"),
+    )
+    if fv is None:
+        return []
+    price = data.get("price")
+    g_used = fv["consensus_growth"]
+    anchor_note = (f"P/S (před ziskovostí)" if fv["anchor"] == "P/S"
+                   else "forward P/E (zisková firma)")
+    cap_note = "  _(růst zastropován)_" if fv.get("capped") else ""
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "*💰 FÉR HODNOTA (oceněno na očekávání):*",
+        f"  Kotva: {anchor_note}  ·  růst {g_used:+.0f}% → fér {fv['anchor']} {fv['fair_mult']:.1f}{cap_note}",
+        f"  🐻 Bear  `{_fmt_money(fv['bear'])}`   (násobek se stlačí)",
+        f"  🎯 Base  `{_fmt_money(fv['base'])}`   ← fér cena",
+        f"  🚀 Bull  `{_fmt_money(fv['bull'])}`   (násobek expanduje)",
+        f"  💵 Teď `{_fmt_money(price)}`  →  *{fv['gap']:+.0f}%* vůči base",
+    ]
+    # Reverse pohled: co je v ceně započítané vs konsenzus.
+    impl = fv["implied_growth"]
+    cons = fv["consensus_growth"]
+    if cons and abs(cons) > 0.1:
+        rel = impl - cons
+        if rel > cons * 0.20:
+            mood = "trh je *optimističtější* než realita — hype zaplacený"
+        elif rel < -cons * 0.20:
+            mood = "trh počítá s *méně* než konsenzus — prostor nahoru"
+        else:
+            mood = "trh ~ v souladu s konsenzem"
+    else:
+        mood = ""
+    lines.append(f"  📊 V ceně započítáno: ~{impl:.0f}% růst  ·  konsenzus {cons:+.0f}%")
+    if mood:
+        lines.append(f"     → _{mood}_")
+    lines.append(f"  🧭 *{fv['verdict']}*")
+    return lines
 
 
 def format_fundamentals(data: dict) -> str:
@@ -1462,6 +1582,7 @@ def format_fundamentals(data: dict) -> str:
         "",
         f"📊 *Investiční skóre:* `{overall_str}`",
         f"   kvalita firmy `{quality_str}/100`  ·  atraktivita ceny `{value_str}/100`",
+        *_fair_value_lines(data),
         "━━━━━━━━━━━━━━━━━━━━━━",
         "*🧪 Fundamentální scorecard:*",
         cat_line("🌱", "Růst", data["growth"]),

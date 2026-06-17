@@ -330,6 +330,44 @@ def test_fmt_price_adaptive_precision():
     assert ag._fmt_price(187.4) == "$187.40"           # ≥ 10 → 2 desetiny
 
 
+def test_fair_value_hype_growth_justifies_high_multiple():
+    # Dvě firmy se stejným P/S 12, ale různým růstem. Rychlejší růst → fér násobek
+    # vyšší → menší gap (není automaticky 'předražená').
+    fast = ag.fair_value(price=100, ps=12, fwd_pe=None, rev_g=45, eps_g=None)
+    slow = ag.fair_value(price=100, ps=12, fwd_pe=None, rev_g=8, eps_g=None)
+    assert fast["gap"] < slow["gap"]            # hype small-cap potrestán míň
+    assert fast["fair_mult"] > slow["fair_mult"]
+
+
+def test_fair_value_picks_ps_anchor_when_unprofitable():
+    # Ztrátový growth (záporná marže) → kotva P/S, ne P/E.
+    fv = ag.fair_value(price=20, ps=15, fwd_pe=80, rev_g=50, eps_g=None, net_margin=-12)
+    assert fv["anchor"] == "P/S"
+
+
+def test_fair_value_picks_pe_anchor_when_profitable():
+    fv = ag.fair_value(price=200, ps=8, fwd_pe=22, rev_g=12, eps_g=18, net_margin=20)
+    assert fv["anchor"] == "P/E"
+
+
+def test_fair_value_implied_growth_reverse():
+    # P/S 9 implikuje (9-1)/0.4 = 20 % růst započítaný v ceně.
+    fv = ag.fair_value(price=50, ps=9, fwd_pe=None, rev_g=20, eps_g=None)
+    assert abs(fv["implied_growth"] - 20.0) < 0.5
+
+
+def test_fair_value_overpriced_verdict():
+    # Vysoké P/S vůči nízkému růstu → výrazně předraženo.
+    fv = ag.fair_value(price=100, ps=20, fwd_pe=None, rev_g=10, eps_g=None)
+    assert fv["gap"] > 40
+    assert "předraženo" in fv["verdict"]
+
+
+def test_fair_value_none_without_anchor():
+    assert ag.fair_value(price=100, ps=None, fwd_pe=None, rev_g=30, eps_g=None) is None
+    assert ag.fair_value(price=None, ps=10, fwd_pe=15, rev_g=10, eps_g=10) is None
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
