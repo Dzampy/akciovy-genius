@@ -1037,6 +1037,7 @@ def make_chart(ticker: str, interval: str = "1d", render: bool = True, flow: boo
     data = {
         "ticker": ticker.upper(),
         "setup_type": setup_type,
+        "status": status,
         "score": best_total_score,
         "sm": sm_score,
         "entry_bot": best_zone_bot,
@@ -1440,7 +1441,10 @@ def _gather_fundamentals(ticker: str) -> dict:
     ocf = num("operatingCashflow")
     rev = num("totalRevenue")
     fcf_margin = (fcf / rev * 100) if (fcf is not None and rev) else None
-    price = num("currentPrice")
+    # currentPrice bývá mimo tržní hodiny prázdné → fallback na další cenová pole,
+    # ať /profil, /dd i /vs nespadnou na chybějící ceně.
+    price = (num("currentPrice") or num("regularMarketPrice")
+             or num("regularMarketPreviousClose") or num("previousClose"))
     dma200 = num("twoHundredDayAverage")
     target = num("targetMeanPrice")
     upside = ((target - price) / price * 100) if (target and price) else None
@@ -2794,6 +2798,138 @@ async def produce_deep_dive(ticker: str) -> str:
     return "\n".join(lines)
 
 # ==============================================================================
+# 3b2. SOUBOJ (/vs) — dvě akcie hlava na hlavu (rozhodnutí 'co z toho koupit')
+# ==============================================================================
+# Nejčastější reálné rozhodnutí investora: 'mám koupit A nebo B?'. Postaví obě
+# vedle sebe přes fundament + fér hodnotu + techniku a u každé metriky označí
+# vítěze (🏆). Verdikt rozdělí na kvalitu / cenu / timing, ať si vybereš podle
+# svého stylu. Vše stateless, staví na existujících enginech.
+
+def _vs_pick(label: str, v1, v2, d1: str, d2: str, higher_better: bool = True):
+    """Jeden řádek souboje: vrať (text, winner) — winner ∈ {1, 2, 0=remíza/N/A}."""
+    if v1 is None and v2 is None:
+        return None, 0
+    if v1 is None:
+        return f" {label}: — · *{d2}* 🏆", 2
+    if v2 is None:
+        return f" {label}: *{d1}* 🏆 · —", 1
+    if abs(v1 - v2) < 1e-9:
+        return f" {label}: {d1} · {d2}  (remíza)", 0
+    win1 = (v1 > v2) if higher_better else (v1 < v2)
+    if win1:
+        return f" {label}: *{d1}* 🏆 · {d2}", 1
+    return f" {label}: {d1} · *{d2}* 🏆", 2
+
+def format_compare(t1: str, t2: str, d1: dict, d2: dict,
+                   tech1: dict | None, tech2: dict | None) -> str:
+    """Sestaví srovnání dvou akcií + verdikt po kategoriích."""
+    prof1, prof2 = _build_profile(d1), _build_profile(d2)
+    fv1 = fair_value(d1.get("price"), d1.get("ps_raw"), d1.get("forward_pe"),
+                     d1.get("rev_g_raw"), d1.get("eps_g_raw"), d1.get("net_m_raw"))
+    fv2 = fair_value(d2.get("price"), d2.get("ps_raw"), d2.get("forward_pe"),
+                     d2.get("rev_g_raw"), d2.get("eps_g_raw"), d2.get("net_m_raw"))
+
+    p1 = d1.get("price"); p2 = d2.get("price")
+    lines = [
+        f"⚔️ *SOUBOJ: {t1} vs {t2}*",
+        f"_{t1} {_fmt_price(p1)} · {t2} {_fmt_price(p2)}_",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "📊 *Fundament*",
+    ]
+    tally = {1: 0, 2: 0}
+
+    def add(label, v1, v2, d1s, d2s, higher=True, cat=True):
+        txt, w = _vs_pick(label, v1, v2, d1s, d2s, higher)
+        if txt:
+            lines.append(txt)
+            if cat and w in (1, 2):
+                tally[w] += 1
+        return w
+
+    # — Fundament —
+    add("Růst tržeb", d1.get("rev_g_raw"), d2.get("rev_g_raw"),
+        _pct_str(d1.get("rev_g_raw")), _pct_str(d2.get("rev_g_raw")))
+    add("Čistá marže", d1.get("net_m_raw"), d2.get("net_m_raw"),
+        _pct_str(d1.get("net_m_raw")), _pct_str(d2.get("net_m_raw")))
+    q1, q2 = prof1.get("quality"), prof2.get("quality")
+    win_q = add("Kvalita firmy", q1, q2,
+                _score_str(q1), _score_str(q2))
+
+    # — Valuace —
+    lines.append("💰 *Valuace*")
+    v1s, v2s = d1["value"]["score"], d2["value"]["score"]
+    add("Levnost (skóre)", v1s, v2s, _score_str(v1s), _score_str(v2s))
+    g1 = fv1["gap"] if fv1 else None
+    g2 = fv2["gap"] if fv2 else None
+    win_val = add("Fér hodnota", g1, g2,
+                  (f"{g1:+.0f}%" if g1 is not None else "—"),
+                  (f"{g2:+.0f}%" if g2 is not None else "—"), higher=False)
+    add("Upside k cíli", d1.get("upside"), d2.get("upside"),
+        _pct_str(d1.get("upside")), _pct_str(d2.get("upside")))
+
+    # — Technika —
+    lines.append("📈 *Technika (timing)*")
+    ts1 = tech1.get("score") if tech1 else None
+    ts2 = tech2.get("score") if tech2 else None
+    st1 = (tech1.get("setup_type", "—") if tech1 else "—")
+    st2 = (tech2.get("setup_type", "—") if tech2 else "—")
+    add("Setup skóre", ts1, ts2,
+        f"{st1.split()[-1] if st1 != '—' else '—'} {ts1 if ts1 is not None else ''}".strip(),
+        f"{st2.split()[-1] if st2 != '—' else '—'} {ts2 if ts2 is not None else ''}".strip())
+    rr1 = tech1.get("rr_zone") if tech1 else None
+    rr2 = tech2.get("rr_zone") if tech2 else None
+    win_tim = add("R:R zóny", rr1, rr2,
+                  (f"1:{rr1:.1f}" if rr1 else "—"), (f"1:{rr2:.1f}" if rr2 else "—"))
+
+    # — Verdikt po kategoriích —
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🧠 *Verdikt*")
+    def name(w): return t1 if w == 1 else t2 if w == 2 else "remíza"
+    lines.append(f" 🏅 Kvalitnější byznys: *{name(win_q)}*")
+    lines.append(f" 💵 Lepší cena vs. fér hodnota: *{name(win_val)}*")
+    lines.append(f" ⏱ Lepší vstup teď: *{name(win_tim)}*")
+
+    overall = 1 if tally[1] > tally[2] else 2 if tally[2] > tally[1] else 0
+    if overall:
+        lines.append(f" 📦 Celkově víc metrik bere *{name(overall)}* ({tally[overall]}:{tally[1 if overall==2 else 2]})")
+    lines.append(
+        f" → _Chceš kvalitu → *{name(win_q)}*. Chceš lepší cenu → *{name(win_val)}*. "
+        f"Nejlepší vstup teď → *{name(win_tim)}*._")
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "ℹ️ _Souboj staví na fundamentu, fér hodnotě a technice. "
+        "Detail jednotlivě: /dd, /profil, /genius. Ne investiční doporučení._",
+    ]
+    return "\n".join(lines)
+
+def _pct_str(x):
+    return f"{x:+.0f}%" if x is not None else "—"
+
+def _score_str(x):
+    return f"{x:.0f}" if x is not None else "—"
+
+async def produce_compare(t1: str, t2: str) -> str:
+    """Sestaví souboj. Fundamenty (tk.info) stahuje SEKVENČNĚ — dvě souběžná
+    info volání Yahoo rate-limituje a jeden ticker by náhodně spadl."""
+    t1, t2 = t1.upper(), t2.upper()
+
+    async def tech(tk):
+        try:
+            _, _, data = await asyncio.to_thread(make_chart, tk, "1d", False, False)
+            return data
+        except Exception:
+            return None
+
+    d1 = await asyncio.to_thread(_gather_fundamentals, t1)
+    d2 = await asyncio.to_thread(_gather_fundamentals, t2)
+    tech1, tech2 = await asyncio.gather(tech(t1), tech(t2))
+    missing = [t for t, d in ((t1, d1), (t2, d2)) if not d or d.get("price") is None]
+    if missing:
+        return (f"❌ Nepodařilo se načíst data pro *{', '.join(missing)}*.\n"
+                f"_Zkontroluj ticker, nebo to zkus za chvíli (Yahoo občas blokuje)._")
+    return format_compare(t1, t2, d1, d2, tech1, tech2)
+
+# ==============================================================================
 # 3c. EDGE LAB — historická validace setupů (backtest)
 # ==============================================================================
 # Přehraje PŘESNĚ stejnou klasifikaci setupů (classify_setup) na trailing oknech
@@ -3942,6 +4078,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "*🧭 Investor (akcie)*\n"
         "• `/dd RKLB` – 🔬 deep dive: co firma dělá, plány, katalyzátory + AI analýza\n"
+        "• `/vs AMD NVDA` – ⚔️ souboj dvou akcií (kvalita vs cena vs timing)\n"
         "• `/profil AAPL` – investiční profil + fundamentální scorecard\n"
         "• `/genius AAPL` – fúze techniky + flow + news (0–100)\n"
         "• `/edge AAPL` – backtest historické úspěšnosti setupů\n"
@@ -4833,6 +4970,20 @@ async def handle_ticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                     f"*{ticker}*:", parse_mode="Markdown",
                                     reply_markup=nav_keyboard(ticker, exclude="chart"))
 
+async def vs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """⚔️ Souboj — dvě akcie hlava na hlavu (fundament + fér hodnota + technika)."""
+    if len(ctx.args) < 2:
+        await update.message.reply_text(
+            "Použití: `/vs AMD NVDA`\n"
+            "_Porovná dvě akcie hlava na hlavu — kvalita, valuace a timing — "
+            "a řekne, která vyhrává v čem._", parse_mode="Markdown")
+        return
+    t1, t2 = ctx.args[0].upper(), ctx.args[1].upper()
+    msg = await update.message.reply_text(
+        f"⚔️ Stavím souboj *{t1}* vs *{t2}*...", parse_mode="Markdown")
+    text = await produce_compare(t1, t2)
+    await deliver_result(msg, update.message, text, None)
+
 async def dd_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """🔬 Deep Dive — co firma dělá, plány, katalyzátory, fér hodnota + AI analýza."""
     if not ctx.args:
@@ -5010,6 +5161,7 @@ def main():
     app.add_handler(CommandHandler(["flow", "unusual", "whales"], flow_cmd))
     app.add_handler(CommandHandler(["rentgen", "xray"], xray_cmd))
     app.add_handler(CommandHandler(["dd", "deepdive"], dd_cmd))
+    app.add_handler(CommandHandler(["vs", "souboj"], vs_cmd))
     app.add_handler(CommandHandler(["genius", "g"], genius_cmd))
     app.add_handler(CommandHandler(["edge", "backtest"], edge_cmd))
     app.add_handler(CommandHandler(["profil", "investice", "earnings"], earnings_cmd))

@@ -473,6 +473,49 @@ def test_dd_dossier_includes_real_news_and_scores():
     assert "OPČNÍ FLOW" in d
 
 
+def test_vs_pick_higher_better():
+    txt, w = ag._vs_pick("Růst", 38.0, 85.0, "+38%", "+85%", higher_better=True)
+    assert w == 2 and "🏆" in txt and "*+85%*" in txt
+
+
+def test_vs_pick_lower_better():
+    # Fér hodnota: nižší (víc pod fér) = lepší cena pro kupce.
+    _, w = ag._vs_pick("Fér", -73.0, -31.0, "-73%", "-31%", higher_better=False)
+    assert w == 1
+
+
+def test_vs_pick_none_and_tie():
+    _, w_none = ag._vs_pick("X", None, 5.0, "—", "5")
+    assert w_none == 2
+    _, w_tie = ag._vs_pick("X", 5.0, 5.0, "5", "5")
+    assert w_tie == 0
+    txt_both, w_both = ag._vs_pick("X", None, None, "—", "—")
+    assert txt_both is None and w_both == 0
+
+
+def _vs_sample(ticker, rev_g, net_m, price, ps, val_score, qual_growth):
+    return {
+        "ticker": ticker, "name": ticker, "price": price,
+        "rev_g_raw": rev_g, "net_m_raw": net_m, "ps_raw": ps,
+        "eps_g_raw": None, "forward_pe": None, "upside": 10.0, "trend": 60.0,
+        "growth": {"score": qual_growth}, "profit": {"score": 60},
+        "balance": {"score": 70}, "value": {"score": val_score},
+        "cashflow": {"score": 50},
+    }
+
+
+def test_format_compare_picks_winner_and_verdict():
+    # NVDA-like (silnější růst/marže) vs AMD-like → kvalita bere ten silnější.
+    strong = _vs_sample("NVDA", 85.0, 63.0, 209.0, 30.0, 46, 100)
+    weak = _vs_sample("AMD", 38.0, 13.0, 140.0, 12.0, 33, 70)
+    tech_s = {"setup_type": "🟢 Pullback Buy", "score": 30, "rr_zone": 1.5}
+    tech_w = {"setup_type": "🟢 Pullback Buy", "score": 35, "rr_zone": 2.0}
+    out = ag.format_compare("NVDA", "AMD", strong, weak, tech_s, tech_w)
+    assert "SOUBOJ: NVDA vs AMD" in out
+    assert "Kvalitnější byznys: *NVDA*" in out      # vyšší růst+marže+kvalita
+    assert "Lepší vstup teď: *AMD*" in out          # lepší R:R + setup skóre
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
